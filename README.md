@@ -6,9 +6,16 @@ A system allowed SQL developers customize query web pages including inputs,outpu
 
 Installation
 ============
-```console
-$ pip3 install -r requirements.txt 
+```bash
+pip3 install -r requirements.txt
 ```
+
+unzip css files and js files for frontend(optional)
+```
+cd static && unzip admin.zip -d admin && unzip codemirror -d codemirror
+cd ..
+```
+
 
 ## Configuration
 Web configurations are in `AnlsTool/setting/setting.py`. Modify it with database setting, as following:
