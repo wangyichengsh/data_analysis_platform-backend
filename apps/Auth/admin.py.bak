@@ -1,0 +1,52 @@
+from django.contrib import admin
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from django.utils.translation import gettext_lazy as _
+from django.contrib.auth.admin import UserAdmin,GroupAdmin
+from .models import UserGroupHistory
+from django.contrib.auth.forms import UserChangeForm
+from django.utils import timezone
+
+# 引用自定义User模型
+User = get_user_model()
+
+
+@admin.register(User)
+class UserAdmin(UserAdmin):
+    fieldsets = (
+        (None, {'fields': ('username', 'password')}),
+        (_('Personal info'), {'fields': ('full_name', 'email')}),
+        (_('Permissions'), {
+            'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions'),
+        }),
+        (_('Important dates'), {'fields': ('last_login', 'date_joined')}),
+    )
+    list_display = ('username', 'email', 'full_name', 'is_staff')
+    search_fields = ('username', 'full_name', 'email')
+
+    # 覆盖get_form，在组变更时维护UserGroupHistory
+    def get_form(self, request, obj=None, **kwargs):
+        # 若用户所在组发生变更，维护历史表
+        if request.method == 'POST':
+            try:
+                user_id = obj.id
+                new_groups = dict(request.POST).get('groups')
+                if new_groups is None:
+                    UserGroupHistory.objects.filter(user_id=user_id,is_valid=True).update(is_valid=False,end_date = timezone.now().date())
+                else:
+                    UserGroupHistory.objects.filter(user_id=user_id, is_valid=True).exclude(group__in=new_groups).update(is_valid=False,end_date=timezone.now().date())
+                    for group_id in new_groups:
+                        UserGroupHistory.objects.create(user_id=user_id,group_id=group_id,eff_date=timezone.now().date(),end_date='3000-12-31',is_valid=True)
+            except:
+                pass
+        """
+        Use special form during user creation
+        """
+        defaults = {}
+        if obj is None:
+            defaults['form'] = self.add_form
+        defaults.update(kwargs)
+        return super().get_form(request, obj, **defaults)
+
+
+

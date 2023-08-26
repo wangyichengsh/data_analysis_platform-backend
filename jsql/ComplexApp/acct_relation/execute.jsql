@@ -1,0 +1,3039 @@
+{% sql:elk %}
+/*  输入
+    start_date:日期
+    end_date:日期
+    lvl4_n:数值
+    账户代码表:param_physical_relation_acct(source_grp,acct_id)
+    股票代码表:param_physical_relation_sec(source_grp,sec_code)
+    无效终端信息表:param_physical_relation_device_not_valid(device_type,device,reason)
+    输出：
+
+*/
+    -- 参数表
+    DROP TABLE IF EXISTS param_physical_relation_acct;
+    CREATE LOCAL TEMPORARY TABLE param_physical_relation_acct
+    (
+        source_grp VARCHAR
+        ,acct_id CHAR(10)
+    )WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id);
+    DROP TABLE IF EXISTS param_physical_relation_sec;
+    CREATE LOCAL TEMPORARY TABLE param_physical_relation_sec
+    (
+        source_grp VARCHAR
+        ,sec_code CHAR(6)
+    )WITH (ORIENTATION = COLUMN) DISTRIBUTE BY HASH(sec_code);
+    DROP TABLE IF EXISTS param_physical_relation_device_not_valid;
+    CREATE LOCAL TEMPORARY TABLE param_physical_relation_device_not_valid
+    (
+        device_type VARCHAR
+        ,device VARCHAR
+        ,reason VARCHAR
+    )WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(device);
+
+
+    {% if acct_id %}
+        INSERT INTO param_physical_relation_acct VALUES {{ acct_id }};
+    {% endif %}
+    {% if sec_code %}
+        INSERT INTO param_physical_relation_sec VALUES {{ sec_code }};
+    {% endif %}
+    {% if ip %}
+        INSERT INTO param_physical_relation_device_not_valid VALUES {{ ip }};
+    {% endif %}
+    {% if mac %}
+        INSERT INTO param_physical_relation_device_not_valid VALUES {{ mac }};
+    {% endif %}
+    {% if hardware %}
+        INSERT INTO param_physical_relation_device_not_valid VALUES {{ hardware }};
+    {% endif %}
+    {% if mobile %}
+        INSERT INTO param_physical_relation_device_not_valid VALUES {{ mobile }};
+    {% endif %}
+
+
+    -- 证券账户与资金账户的对应关系
+    DROP TABLE IF EXISTS tmp_acct_cap;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_cap
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(mem_code_8, cap_acct_id)
+    AS (
+        SELECT  t2.source_grp
+                ,t2.acct_id
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+        FROM    pd_data_os.txn_settle_cap_sipf t1
+                ,param_physical_relation_acct t2
+        WHERE   t1.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     t1.acct_id = t2.acct_id
+        UNION
+        SELECT  t2.source_grp
+                ,t2.acct_id
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+        FROM    pd_data_os.txn_credit_cap_sipf t1
+                ,param_physical_relation_acct t2
+        WHERE   t1.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     t1.acct_id = t2.acct_id
+    );
+
+    -- 分析期间对目标股单边累计成交量最小值
+    DROP TABLE IF EXISTS tmp_trade;
+    CREATE LOCAL TEMPORARY TABLE tmp_trade
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        WITH t1 AS (
+        SELECT  b.source_grp,b.acct_id
+                ,SUM(a.buy_vol+a.bt_buy_vol+COALESCE(a.pfp_buy_vol,0)) AS buy_vol
+                ,SUM(a.sell_vol+a.bt_sell_vol+COALESCE(a.pfp_sell_vol,0)) AS sell_vol
+        FROM    pd_data_ap.app_acct_sec_trade_day a
+                ,param_physical_relation_acct b
+                ,param_physical_relation_sec c
+        WHERE   a.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     a.acct_id = b.acct_id
+        AND     a.sec_code = c.sec_code
+        group by 1,2
+        )
+        SELECT  source_grp,acct_id,buy_vol,sell_vol
+                ,GREATEST(buy_vol,sell_vol) AS trade_vol
+        FROM   	t1
+    );
+
+    -- 结算明细
+    DROP TABLE IF EXISTS tmp_txn_settle_cap_sipf;
+    CREATE LOCAL TEMPORARY TABLE tmp_txn_settle_cap_sipf
+        WITH (ORIENTATION = COLUMN)
+        -- ON COMMIT DELETE ROWS
+        DISTRIBUTE BY HASH(mem_code_8, cap_acct_id)
+    AS (
+        SELECT  t1.trade_date
+                ,t2.source_grp
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t2.acct_id AS relate_acct
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+                ,SUM(ABS(t1.trans_amt)) AS trans_amt
+        FROM    pd_data_os.txn_settle_cap_sipf t1
+                ,tmp_acct_cap t2
+        WHERE   t1.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     LENGTH(t1.device_trace) > 3
+        AND     t1.cap_acct_id = t2.cap_acct_id
+        AND     t1.mem_code_8 = t2.mem_code_8
+        GROUP BY t1.trade_date
+                ,t2.source_grp
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t2.acct_id
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+    );
+    DROP TABLE IF EXISTS tmp_txn_credit_cap_sipf;
+    CREATE LOCAL TEMPORARY TABLE tmp_txn_credit_cap_sipf
+        WITH (ORIENTATION = COLUMN)
+        -- ON COMMIT DELETE ROWS
+        DISTRIBUTE BY HASH(mem_code_8, cap_acct_id)
+    AS (
+        SELECT  t1.trade_date
+                ,t2.source_grp
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t2.acct_id AS relate_acct
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+                ,SUM(ABS(t1.trans_amt)) AS trans_amt
+        FROM    pd_data_os.txn_credit_cap_sipf t1
+                ,tmp_acct_cap t2
+        WHERE   t1.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     LENGTH(t1.device_trace) > 3
+        AND     t1.cap_acct_id = t2.cap_acct_id
+        AND     t1.mem_code_8 = t2.mem_code_8
+        GROUP BY t1.trade_date
+                ,t2.source_grp
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t2.acct_id
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+    );
+    DROP TABLE IF EXISTS tmp_txn_cap_dep_withdr_sipf;
+    CREATE LOCAL TEMPORARY TABLE tmp_txn_cap_dep_withdr_sipf
+        WITH (ORIENTATION = COLUMN)
+        -- ON COMMIT DELETE ROWS
+        DISTRIBUTE BY HASH(mem_code_8, cap_acct_id)
+    AS (
+            SELECT  t1.trade_date
+                    ,t2.source_grp
+                    ,t1.cap_acct_id
+                    ,t1.mem_code_8
+                    ,t2.acct_id AS relate_acct
+                    ,'' AS acct_id
+                    -- ,'' AS sec_code
+                    ,t1.device_trace
+                    ,t1.ip_addr
+                    ,t1.ip_addr2
+                    ,t1.mac_addr
+                    ,t1.mac_addr2
+                    ,t1.other_addr
+                    ,t1.disk_sn
+                    ,SUM(ABS(t1.trans_amt)) AS trans_amt
+            FROM    pd_data_os.txn_cap_dep_withdr_sipf t1
+                    ,tmp_acct_cap t2
+            WHERE   t1.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+            AND     LENGTH(t1.device_trace) > 3
+            AND     t1.cap_acct_id = t2.cap_acct_id
+            AND     t1.mem_code_8 = t2.mem_code_8
+            GROUP BY t1.trade_date
+                    ,t2.source_grp
+                    ,t1.cap_acct_id
+                    ,t1.mem_code_8
+                    ,t2.acct_id
+                    --,t1.acct_id
+                    -- ,sec_code
+                    ,t1.device_trace
+                    ,t1.ip_addr
+                    ,t1.ip_addr2
+                    ,t1.mac_addr
+                    ,t1.mac_addr2
+                    ,t1.other_addr
+                    ,t1.disk_sn
+    );
+    DROP TABLE IF EXISTS tmp_acct_cap_trade_1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_cap_trade_1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(relate_acct)
+    AS (
+        SELECT  t1.trade_date
+                ,t1.source_grp
+                ,t1.relate_acct
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+                ,t1.trans_amt AS trans_amt
+        FROM    tmp_txn_settle_cap_sipf t1
+        UNION ALL
+        SELECT  t1.trade_date
+                ,t1.source_grp
+                ,t1.relate_acct
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,t1.acct_id
+                ,t1.sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+                ,t1.trans_amt AS trans_amt
+        FROM    tmp_txn_credit_cap_sipf t1
+        UNION ALL
+        SELECT  t1.trade_date
+                ,t1.source_grp
+                ,t1.relate_acct
+                ,t1.cap_acct_id
+                ,t1.mem_code_8
+                ,'' AS acct_id
+                ,'' AS sec_code
+                ,t1.device_trace
+                ,t1.ip_addr
+                ,t1.ip_addr2
+                ,t1.mac_addr
+                ,t1.mac_addr2
+                ,t1.other_addr
+                ,t1.disk_sn
+                ,t1.trans_amt
+        FROM    tmp_txn_cap_dep_withdr_sipf t1
+    );
+    DROP TABLE IF EXISTS tmp_acct_cap_trade;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_cap_trade
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(relate_acct)
+    AS (
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,device_trace
+                ,ip_addr
+                ,ip_addr2
+                ,mac_addr
+                ,mac_addr2
+                ,other_addr
+                ,disk_sn
+                ,SUM(trans_amt) AS trans_amt
+        FROM    tmp_acct_cap_trade_1
+        GROUP BY
+                trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,device_trace
+                ,ip_addr
+                ,ip_addr2
+                ,mac_addr
+                ,mac_addr2
+                ,other_addr
+                ,disk_sn
+    );
+    -- DELETE FROM tmp_txn_settle_cap_sipf;
+    -- DELETE FROM tmp_txn_credit_cap_sipf;
+    -- DELETE FROM tmp_txn_cap_dep_withdr_sipf;
+
+    DROP TABLE IF EXISTS tmp_acct_cap_device;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_cap_device
+        WITH (ORIENTATION = ROW)
+        DISTRIBUTE BY HASH(device)
+    AS (
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'IP' AS device_type
+                ,ip_addr AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   REGEXP_LIKE(ip_addr,'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        UNION
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'IP' AS device_type
+                ,ip_addr2 AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   REGEXP_LIKE(ip_addr2,'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        UNION
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'MAC' AS device_type
+                ,mac_addr AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   mac_addr <> ''
+        UNION
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'MAC' AS device_type
+                ,mac_addr2 AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   mac_addr2 <> ''
+        UNION
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'MOBILE' AS device_type
+                ,other_addr AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   other_addr <> ''
+        UNION
+        SELECT  trade_date
+                ,source_grp
+                ,relate_acct
+                ,cap_acct_id
+                ,mem_code_8
+                ,acct_id
+                ,sec_code
+                ,trans_amt
+                ,'HARDWARE' AS device_type
+                ,disk_sn AS device
+                ,'1' AS is_valid
+        FROM    tmp_acct_cap_trade
+        WHERE   disk_sn <> ''
+    );
+
+    -- 增加开户预留电话信息（作为虚拟终端流水数据写入）
+    DROP TABLE IF EXISTS tmp_act_acct_info_his;
+    CREATE LOCAL TEMPORARY TABLE tmp_act_acct_info_his
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT b.source_grp,b.acct_id AS relate_acct,a.ccrc_acct_id,a.acct_id
+            FROM    pd_data.act_acct_ccrc_his_1 a
+                    ,param_physical_relation_acct b
+            WHERE   a.acct_id = b.acct_id
+            AND     a.eff_date <= {{ end_date }}
+            AND     a.end_date > {{ start_date }}
+        )
+        SELECT  DISTINCT a.*,b.mobile,b.telephone,c.cap_acct_id,c.mem_code_8
+        FROM    t1 a
+                ,sd_view.act_acct_info_his b
+                ,tmp_acct_cap c
+        WHERE   a.ccrc_acct_id = b.ccrc_acct_id
+        AND     a.source_grp = c.source_grp
+        AND     a.relate_acct = c.acct_id
+    );
+
+    -- 增加开户预留电话方式
+    DROP TABLE IF EXISTS tmp_acct_kh_telephone;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_kh_telephone
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  source_grp,relate_acct,cap_acct_id,mem_code_8,acct_id, mobile AS device, 'MOBILE' AS device_type
+        FROM    tmp_act_acct_info_his
+        WHERE   mobile <> ''
+        UNION
+        SELECT  source_grp,relate_acct,cap_acct_id,mem_code_8,acct_id, telephone AS device, 'MOBILE' AS device_type
+        FROM    tmp_act_acct_info_his
+        WHERE   telephone <> ''
+    );
+    INSERT INTO tmp_acct_cap_device
+    SELECT  NULL AS trade_date
+            ,source_grp
+            ,relate_acct
+            ,cap_acct_id
+            ,mem_code_8
+            ,acct_id
+            ,NULL AS sec_code
+            ,NULL AS trans_amt
+            ,device_type
+            ,device
+            ,'1' AS is_valid
+    FROM    tmp_acct_kh_telephone
+    ;
+
+    -- 剔除无效的IP信息
+    /*
+        1级中需剔除
+        （1）错误IP：
+        127.0.0.1
+        0.0.0.0
+        某一字段大于255的IP
+        （2）已知内网IP
+        172.16.0.0-172.31.255.255
+        192.168.0.0-192.168.255.255
+        10.0.0.0-10.255.255.255
+    */
+    INSERT INTO param_physical_relation_device_not_valid
+    SELECT  DISTINCT device_type,device,'错误IP' AS reason
+    FROM    tmp_acct_cap_device
+    WHERE   device_type = 'IP'
+    AND     (device IN ('127.0.0.1','0.0.0.0')
+            OR device LIKE '172.16%'
+            OR device LIKE '172.17%'
+            OR device LIKE '172.18%'
+            OR device LIKE '172.19%'
+            OR device LIKE '172.20%'
+            OR device LIKE '172.21%'
+            OR device LIKE '172.22%'
+            OR device LIKE '172.23%'
+            OR device LIKE '172.24%'
+            OR device LIKE '172.25%'
+            OR device LIKE '172.26%'
+            OR device LIKE '172.27%'
+            OR device LIKE '172.28%'
+            OR device LIKE '172.29%'
+            OR device LIKE '172.30%'
+            OR device LIKE '172.31%'
+            OR device LIKE '192.168%'
+            OR device LIKE '10%'
+            );
+
+    DELETE FROM tmp_acct_cap_device
+    WHERE   device_type = 'IP'
+    AND     (device IN ('127.0.0.1','0.0.0.0')
+            OR device LIKE '172.16%'
+            OR device LIKE '172.17%'
+            OR device LIKE '172.18%'
+            OR device LIKE '172.19%'
+            OR device LIKE '172.20%'
+            OR device LIKE '172.21%'
+            OR device LIKE '172.22%'
+            OR device LIKE '172.23%'
+            OR device LIKE '172.24%'
+            OR device LIKE '172.25%'
+            OR device LIKE '172.26%'
+            OR device LIKE '172.27%'
+            OR device LIKE '172.28%'
+            OR device LIKE '172.29%'
+            OR device LIKE '172.30%'
+            OR device LIKE '172.31%'
+            OR device LIKE '192.168%'
+            OR device LIKE '10%'
+            );
+
+    INSERT INTO param_physical_relation_device_not_valid
+    WITH t1 AS (
+        SELECT  device
+                ,CAST(UNNEST(STRING_TO_ARRAY(device,'.')) AS INT) AS ip_num
+        FROM    tmp_acct_cap_device
+        WHERE   device_type = 'IP'
+    )
+    ,t2 AS (    -- 单个ip数字大于255的ip
+        SELECT  DISTINCT device
+        FROM    t1
+        WHERE   ip_num > 255
+    )
+    SELECT  DISTINCT t0.device_type,t0.device,'错误IP' AS reason
+    FROM    tmp_acct_cap_device t0
+    WHERE   t0.device_type = 'IP'
+    AND     EXISTS(
+                    SELECT  1
+                    FROM    t2
+                    WHERE   t0.device = t2.device
+                )
+    ;
+
+    WITH t1 AS (
+        SELECT  device
+                ,CAST(UNNEST(STRING_TO_ARRAY(device,'.')) AS INT) AS ip_num
+        FROM    tmp_acct_cap_device
+        WHERE   device_type = 'IP'
+    )
+    ,t2 AS (    -- 单个ip数字大于255的ip
+        SELECT  DISTINCT device
+        FROM    t1
+        WHERE   ip_num > 255
+    )
+    DELETE FROM tmp_acct_cap_device t0
+    WHERE   t0.device_type = 'IP'
+    AND     EXISTS(
+                    SELECT  1
+                    FROM    t2
+                    WHERE   t0.device = t2.device
+                )
+    ;
+    -- 其他无效终端
+    -- (1)稽查局认定无效MAC：
+    INSERT INTO param_physical_relation_device_not_valid
+        SELECT  DISTINCT device_type,device,'稽查局认定无效MAC' AS reason
+        FROM    tmp_acct_cap_device
+        WHERE   device_type = 'MAC'
+        AND     device IN ('0C5B8F279A64','021E101F0000','001E101F0000','9AE0D98F0D39','0A6D41B92CB4','390A7347E119','A634D979BA76','FA163E1E005E','265016F72B5A','020000000000');
+
+    -- (2)多账户使用MAC:每月使用该终端交易的资金账户数最大值≥1000或每月市场平均每个交易日使用该终端交易账户数最大值≥100
+    -- (3)多券商使用MAC:每月使用某一MAC地址的资金账户数最大值超过500个、且对应证券公司个数超过15个
+    -- (4)多账户使用IP:每月使用该终端交易资金账户数最大值≥1000或每月市场平均每个交易日使用该终端交易资金账户数最大值≥100
+    -- (5)多券商使用IP:每月使用某一IP地址的账户最大值数超过500个、且对应证券公司个数超过15个
+    -- (6)多账户使用手机号码:每月使用该终端交易资金账户数最大值≥100
+    -- (7)多账户使用硬盘序列号:每月使用该终端交易资金账户数最大值≥1000或每月市场平均每个交易日使用该终端交易资金账户数最大值≥100
+    -- (8)多账户使用硬盘序列号:每月使用该硬盘序列号的资金账户数最大值超过500个、且对应证券公司个数超过15个
+    -- (10)其他手动传入的无效终端信息
+    DROP TABLE IF EXISTS tmp_device;
+    CREATE LOCAL TEMPORARY TABLE tmp_device
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(device_type,device)
+    AS (
+        SELECT DISTINCT
+                device_type
+                ,device
+        FROM    tmp_acct_cap_device
+    );
+    -- 计算每日终端资金账户数和证券公司数
+    DROP TABLE IF EXISTS tmp_device_cnt_day;
+    CREATE LOCAL TEMPORARY TABLE tmp_device_cnt_day
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(device)
+    AS (
+        SELECT  a.*
+        FROM    pd_temp_jcb.app_device_summary_res_day a
+                ,tmp_device b
+        WHERE   a.trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     a.device_type = b.device_type
+        AND     a.device = b.device
+    );
+    -- 计算每月终端资金账户数和证券公司数
+    DROP TABLE IF EXISTS tmp_device_cnt_month;
+    CREATE LOCAL TEMPORARY TABLE tmp_device_cnt_month
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(device)
+    AS (
+        SELECT  a.*
+        FROM    pd_temp_jcb.app_device_summary_res_month a
+                ,tmp_device b
+        WHERE   a.trade_month BETWEEN TO_CHAR({{ start_date }},'YYYYMM') AND TO_CHAR({{ end_date }},'YYYYMM')
+        AND     a.data_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     a.device_type = b.device_type
+        AND     a.device = b.device
+    );
+
+    WITH t1 AS (
+        SELECT  TO_CHAR(trade_date,'YYYYMM') AS trade_month
+                ,device_type
+                ,device
+                ,AVG(cnt_cap_acct) AS avg_cnt_cap_acct
+                ,AVG(cnt_mem) AS avg_cnt_mem
+        FROM    tmp_device_cnt_day
+        GROUP BY
+                trade_month
+                ,device_type
+                ,device
+    )
+    ,t2 AS (
+        SELECT  device_type
+                ,device
+                ,MAX(avg_cnt_cap_acct) AS max_avg_cnt_cap_acct_day
+                ,MAX(avg_cnt_mem) AS max_avg_cnt_mem_day
+        FROM    t1
+        GROUP BY
+                device_type
+                ,device
+    )
+    ,t3 AS (
+        SELECT  device_type
+                ,device
+                ,MAX(cnt_cap_acct) AS max_cnt_cap_acct_month
+                ,MAX(cnt_mem) AS max_cnt_mem_month
+        FROM    tmp_device_cnt_month
+        GROUP BY
+                device_type
+                ,device
+    )
+    ,t4 AS (
+        SELECT  t2.device_type
+                ,t3.device
+                ,COALESCE(t2.max_avg_cnt_cap_acct_day,0) AS max_avg_cnt_cap_acct_day
+                ,COALESCE(t2.max_avg_cnt_mem_day,0) AS max_avg_cnt_mem_day
+                ,COALESCE(t3.max_cnt_cap_acct_month,0) AS max_cnt_cap_acct_month
+                ,COALESCE(t3.max_cnt_mem_month,0) AS max_cnt_mem_month
+        FROM    t2
+        LEFT JOIN
+                t3
+        ON      t2.device_type = t3.device_type
+        AND     t2.device = t3.device
+    )
+    ,t5 AS (
+        SELECT  device_type,device,'多账户使用MAC' AS reason
+        FROM    t4
+        WHERE   device_type = 'MAC' AND (max_cnt_cap_acct_month>=1000 OR max_avg_cnt_cap_acct_day>=100)
+        UNION ALL
+        SELECT  device_type,device,'多账户使用MAC' AS reason
+        FROM    t4
+        WHERE   device_type = 'MAC' AND (max_cnt_cap_acct_month>=500 AND max_cnt_mem_month>=15)
+        UNION ALL
+        SELECT  device_type,device,'多账户使用IP' AS reason
+        FROM    t4
+        WHERE   device_type = 'IP' AND (max_cnt_cap_acct_month>=1000 OR max_avg_cnt_cap_acct_day>=100)
+        UNION ALL
+        SELECT  device_type,device,'多券商使用IP' AS reason
+        FROM    t4
+        WHERE   device_type = 'IP' AND (max_cnt_cap_acct_month>=500 AND max_cnt_mem_month>=15)
+        UNION ALL
+        SELECT  device_type,device,'多账户使用手机号码' AS reason
+        FROM    t4
+        WHERE   device_type = 'MOBILE' AND max_cnt_cap_acct_month>=100
+        UNION ALL
+        SELECT  device_type,device,'多账户使用硬盘序列号' AS reason
+        FROM    t4
+        WHERE   device_type = 'HARDWARE' AND (max_cnt_cap_acct_month>=1000 OR max_avg_cnt_cap_acct_day>=100)
+        UNION ALL
+        SELECT  device_type,device,'多券商使用硬盘序列号' AS reason
+        FROM    t4
+        WHERE   device_type = 'HARDWARE' AND (max_cnt_cap_acct_month>=500 AND max_cnt_mem_month>=15)
+    )
+    INSERT INTO param_physical_relation_device_not_valid
+    SELECT  device_type
+            ,device
+            ,reason
+    FROM    t5;
+
+    -- -- (9)动态IP：以“117.61”“117.136”“223.104”开头的IP
+    INSERT INTO param_physical_relation_device_not_valid
+    SELECT  DISTINCT device_type,device,'动态IP' AS reason
+    FROM    tmp_acct_cap_device
+    WHERE   device_type = 'IP'
+    AND     (SUBSTR(device,1,7) IN ('117.136','223.104')
+            OR SUBSTR(device,1,6) = '117.61')
+    ;
+
+    -- (10) 涉嫌虚假MAC
+    INSERT INTO param_physical_relation_device_not_valid
+    SELECT  DISTINCT device_type,device,'涉嫌虚假MAC' AS reason
+    FROM    tmp_acct_cap_device
+    WHERE   device_type = 'MAC'
+    AND     device IN ('020000000000','000000000001','222222222222');
+
+    -- 合并无效终端原因
+    DROP TABLE IF EXISTS tmp_param_physical_relation_device_not_valid;
+    CREATE LOCAL TEMPORARY TABLE tmp_param_physical_relation_device_not_valid
+    AS (
+        WITH t1 AS (
+            SELECT DISTINCT * FROM param_physical_relation_device_not_valid
+        )
+        SELECT  device_type
+                ,device
+                ,STRING_AGG(reason,';' ORDER BY reason) AS reason
+        FROM    t1
+        GROUP BY 1,2
+    );
+
+    -- 剔除无效终端
+    DELETE FROM tmp_acct_cap_device a
+    WHERE   EXISTS (
+                SELECT  1
+                FROM    param_physical_relation_device_not_valid b
+                WHERE   a.device_type = b.device_type
+                AND     a.device = b.device
+            );
+
+    DROP TABLE IF EXISTS tmp_acct_cap_device_2;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_cap_device_2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(device)
+    AS (
+     SELECT DISTINCT
+                    a.source_grp
+                    ,a.relate_acct
+                    ,a.device_type
+                    ,a.device
+                    ,c.sec_code
+                    ,(CASE WHEN a.device_type = 'IP' THEN a.trade_date ELSE NULL END) as trade_date     -- 对IP需要计算最短间隔交易天数
+            FROM    tmp_acct_cap_device a
+             LEFT JOIN
+                    param_physical_relation_sec c
+            ON      a.source_grp = c.source_grp
+            AND     a.sec_code = c.sec_code
+    );
+
+    DROP TABLE IF EXISTS tmp_relation_device_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_relation_device_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t2 AS (
+            SELECT  DISTINCT a.source_grp AS source_grp
+                    ,a.relate_acct AS acct_id_1
+                    ,b.relate_acct AS acct_id_2
+                    ,a.device_type
+                    ,a.device
+                    -- ,(CASE WHEN c.sec_code IS NOT NULL AND a.sec_code = b.sec_code THEN c.sec_code ELSE '' END) AS sec_code
+                    ,a.sec_code AS sec_code_1
+                    ,b.sec_code AS sec_code_2
+                    ,a.trade_date AS trade_date_1
+                    ,b.trade_date AS trade_date_2
+                    --,2 AS relation_level
+                    -- ,(CASE WHEN sec_code_1 IS NOT NULL AND sec_code_2 IS NOT NULL THEN 1 ELSE 0 END) AS is_relate_target_sec   -- 是否通过目标股票关联
+            FROM    tmp_acct_cap_device_2 a
+            INNER JOIN
+                    tmp_acct_cap_device_2 b
+            ON      a.source_grp = b.source_grp
+            AND     a.device_type = b.device_type
+            AND     a.device = b.device
+            AND     a.relate_acct < b.relate_acct
+            -- LEFT JOIN
+            --         param_physical_relation_sec c
+            -- ON      a.source_grp = c.source_grp
+            -- AND     a.sec_code = c.sec_code
+        )
+        ,t3 AS (
+            SELECT  trade_date,ROW_NUMBER() OVER(ORDER BY trade_date) AS rn
+            FROM    pd_data.ctl_tx_date
+            WHERE   trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        )
+        ,t4 AS (
+            SELECT  distinct a.*
+                    ,ABS(b.rn - c.rn) AS diff_trade_date                            -- 交易日相差天数
+            FROM    t2 a
+            LEFT JOIN
+                    t3 b
+            ON      a.trade_date_1 = b.trade_date
+            LEFT JOIN
+                    t3 c
+            ON      a.trade_date_2 = c.trade_date
+        )
+        ,t5 AS (
+            SELECT  source_grp
+                     ,acct_id_1
+                     ,acct_id_2
+                     ,device_type
+                     ,device
+                     ,STRING_AGG(DISTINCT sec_code_1,',' ORDER BY sec_code_1)  AS sec_code_1             -- 账户1交易的股票，若非目标股票则为空
+                     ,STRING_AGG(DISTINCT sec_code_2,',' ORDER BY sec_code_2)  AS sec_code_2             -- 账户2交易的股票，若非目标股票则为空
+                     -- ,is_relate_target_sec   -- 是否通过目标股票关联
+                     ,MIN(diff_trade_date) AS  diff_trade_date       -- 交易日相差天数
+            FROM    t4
+            GROUP BY
+                    source_grp
+                     ,acct_id_1
+                     ,acct_id_2
+                     ,device_type
+                     ,device
+        )
+        ,t6 AS (
+            SELECT   source_grp
+                     ,acct_id_1
+                     ,acct_id_2
+                     ,device_type
+                     ,device
+                     ,sec_code_1             -- 账户1交易的股票，若非目标股票则为空
+                     ,sec_code_2             -- 账户2交易的股票，若非目标股票则为空
+                     ,(CASE WHEN sec_code_1 IS NOT NULL AND sec_code_2 IS NOT NULL THEN 1 ELSE 0 END) AS is_relate_target_sec   -- 是否通过目标股票关联
+                     ,diff_trade_date        -- 交易日相差天数
+                    ,1 AS relation_lvl_2
+                    ,(CASE  WHEN (device_type = 'IP' AND (diff_trade_date = 0 OR is_relate_target_sec = 1)) THEN 1
+                            WHEN device_type IN ('MAC','HARDWARE','MOBILE') THEN 1
+                        ELSE 0 END) AS relation_lvl_3
+                    ,(CASE
+                        WHEN is_relate_target_sec = 1 AND  (device_type IN ('MAC','HARDWARE','MOBILE') OR device_type = 'IP' AND  diff_trade_date <= {{ lvl4_n }}) THEN 1
+                        ELSE 0
+                     END) AS relation_lvl_4
+            FROM    t5
+        )
+        SELECT  a.*
+                ,(case when a.acct_id_1 = b.acct_id AND a.device_type='MOBILE' AND a.device=b.device AND a.diff_trade_date IS NULL THEN 2 ELSE 1 END) AS flag_acct_id_1       -- 账户1与终端的关系（优先取终端流水信息。1：终端流水信息，2：开户信息。）
+                ,(case when a.acct_id_2 = c.acct_id AND a.device_type='MOBILE' AND a.device=c.device AND a.diff_trade_date IS NULL THEN 2 ELSE 1 END) AS flag_acct_id_2       -- 账户2与终端的关系（优先取终端流水信息。1：终端流水信息，2：开户信息。）
+        FROM    t6 a
+        LEFT JOIN
+                tmp_acct_kh_telephone b
+        ON      a.acct_id_1 = b.acct_id AND a.device_type='MOBILE' AND a.device=b.device AND a.diff_trade_date IS NULL
+        LEFT JOIN
+                tmp_acct_kh_telephone c
+        ON      a.acct_id_2 = c.acct_id AND a.device_type='MOBILE' AND a.device=c.device AND a.diff_trade_date IS NULL
+    );
+
+
+    -- 2级关联
+    DROP TABLE IF EXISTS tmp_relation_device_lvl_2;
+    CREATE LOCAL TEMPORARY TABLE tmp_relation_device_lvl_2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  DISTINCT
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,device_type
+                ,device
+                ,2 AS relation_level
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_2 = 1
+    );
+
+    -- 3级关联
+    DROP TABLE IF EXISTS tmp_relation_device_lvl_3;
+    CREATE LOCAL TEMPORARY TABLE tmp_relation_device_lvl_3
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  DISTINCT
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,device_type
+                ,device
+                ,3 AS relation_level
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_3 = 1
+    );
+
+    -- 4级关联
+    DROP TABLE IF EXISTS tmp_relation_device_lvl_4;
+    CREATE LOCAL TEMPORARY TABLE tmp_relation_device_lvl_4
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  DISTINCT
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,device_type
+                ,device
+                ,4 AS relation_level
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_4 = 1
+
+    );
+
+    -- 2、3、4合并（终端关联）
+    DROP TABLE IF EXISTS tmp_acct_relation_device_merge;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_device_merge
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT * FROM tmp_relation_device_lvl_2
+            UNION ALL
+            SELECT * FROM tmp_relation_device_lvl_3
+            UNION ALL
+            SELECT * FROM tmp_relation_device_lvl_4
+        )
+        SELECT  source_grp,acct_id_1,acct_id_2,MAX(relation_level) AS relation_level,1 AS device_relation
+        FROM    t1
+        GROUP BY 1,2,3
+    );
+
+
+    -- 5级关联
+    -- 账户信息
+    DROP TABLE IF EXISTS tmp_acct_info1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_info1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  t1.source_grp
+                ,t1.acct_id
+                ,t2.acct_name
+                ,t2.ccrc_acct_id
+                ,t2.id_card
+                ,t2.legal_repr_id_card              -- 法人身份证
+        FROM    param_physical_relation_acct t1
+                ,sd_view.act_acct_info_his t2
+        WHERE   t2.eff_date <= {{ end_date }}
+        AND     t2.end_date > {{ end_date }}
+        AND     t1.acct_id = t2.acct_id
+    );
+    -- 账户类型
+    DROP TABLE IF EXISTS tmp_acct_jg_all;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_jg_all
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(ccrc_acct_id)
+    AS (
+        WITH t1 AS (
+            SELECT  acct_id
+                    ,(CASE
+                        WHEN acct_sub_type IN ('011','012','022','023','031','032','062','063','071','081','092','131') THEN '资管'
+                        ELSE '机构'
+                    END) AS acct_type
+            FROM    sd_data.act_acct_inst_type_jcb
+            WHERE   trade_date = {{ end_date }}
+        )
+        SELECT  t1.acct_id
+                ,t1.acct_type
+                ,t2.ccrc_acct_id
+        FROM    t1
+                ,sd_view.act_acct_info_his t2
+        WHERE   t1.acct_id = t2.acct_id
+        AND     t2.eff_date <= {{ end_date }}
+        AND     t2.end_date > {{ end_date }}
+    );
+    DROP TABLE IF EXISTS tmp_acct_info;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_info
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(ccrc_acct_id)
+    AS (
+        SELECT  DISTINCT
+                t1.*
+                -- ,t2.open_date
+                ,(CASE
+                    WHEN t1.ccrc_acct_id = t3.ccrc_acct_id THEN t3.acct_type
+                    ELSE '个人'
+                END) AS acct_type
+        FROM    tmp_acct_info1 t1
+        -- LEFT JOIN
+        --         tmp_acct_info2 t2
+        -- ON      t1.acct_id = t2.acct_id
+        LEFT JOIN
+                tmp_acct_jg_all t3
+        ON      t1.ccrc_acct_id = t3.ccrc_acct_id
+    );
+    -- 账户证件号、联系电话(固定电话、手机)、联系地址(联系地址、证件地址) 并集            ##################效率很低，建议不取并集####################
+    DROP TABLE IF EXISTS tmp_acct_kh_info;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_kh_info
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  t1.source_grp
+                ,t1.acct_id
+                ,t2.id_card
+                ,(CASE
+                    WHEN LENGTH(t2.address)<=6 THEN ''
+                    WHEN t2.address IN ('接口填写','默认地址','客户地址不详') THEN ''
+                    ELSE t2.address
+                END) AS address
+                ,(CASE
+                    WHEN LENGTH(t2.id_card_addr)<=6 THEN ''
+                    WHEN t2.id_card_addr IN ('接口填写','默认地址','客户地址不详') THEN ''
+                    ELSE t2.id_card_addr
+                END)   AS id_card_addr
+                ,(CASE
+                    WHEN LENGTH(t2.mobile)<=6 THEN ''
+                    ELSE t2.mobile
+                END) AS mobile
+                ,(CASE
+                    WHEN LENGTH(t2.telephone)<=6 THEN ''
+                    ELSE t2.telephone
+                END) AS telephone
+        FROM    param_physical_relation_acct t1
+                ,sd_view.act_acct_info_his t2
+        WHERE   t1.acct_id = t2.acct_id
+    );
+    DROP TABLE IF EXISTS tmp_acct_info_all;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_info_all
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        WITH t1 AS (
+            SELECT  a.*
+                    --,b.id_card
+                    ,b.telephone AS phone
+            FROM    tmp_acct_info a
+                    ,tmp_acct_kh_info b
+            WHERE   a.acct_id = b.acct_id
+            AND     b.telephone <> ''
+            UNION
+            SELECT  a.*
+                    --,b.id_card
+                    ,b.mobile AS phone
+            FROM    tmp_acct_info a
+                    ,tmp_acct_kh_info b
+            WHERE   a.acct_id = b.acct_id
+            AND     b.mobile <> ''
+        )
+        ,t2 AS (
+            SELECT  a.*
+                    --,b.id_card
+                    ,b.address
+            FROM    tmp_acct_info a
+                    ,tmp_acct_kh_info b
+            WHERE   a.acct_id = b.acct_id
+            AND     b.address <> ''
+            UNION
+            SELECT  a.*
+                    --,b.id_card
+                    ,b.id_card_addr AS address
+            FROM    tmp_acct_info a
+                    ,tmp_acct_kh_info b
+            WHERE   a.acct_id = b.acct_id
+            AND     b.id_card_addr <> ''
+        )
+        SELECT  DISTINCT t1.*
+                ,t2.address
+        FROM    t1
+                ,t2
+        WHERE   t1.acct_id = t2.acct_id
+    );
+
+    -- 资管账户信息
+    DROP TABLE IF EXISTS tmp_acct_am_info;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_am_info
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  t1.source_grp
+                ,t1.acct_id
+                ,t1.ccrc_acct_id
+                ,t2.invest_cnsltnt_id_card      -- 投资顾问证件号
+                ,t2.cnsltnt_rep_id_card         -- 投资顾问代表证件号
+                ,t2.actl_operator_id_card       -- 实际操作人证件号
+        FROM    tmp_acct_info t1
+                ,pd_data.act_am_acct_info_his t2
+        WHERE   t1.acct_type = '资管'
+        AND     t2.eff_date <= {{ end_date }}
+        AND     t2.end_date > {{ end_date }}
+        AND     t1.acct_id = t2.acct_id
+        UNION
+        SELECT  t1.source_grp
+                ,t1.acct_id
+                ,t1.ccrc_acct_id
+                ,t2.invest_cnsltnt_id_card      -- 投资顾问证件号
+                ,t2.cnsltnt_rep_id_card         -- 投资顾问代表证件号
+                ,t2.actl_operator_id_card       -- 实际操作人证件号
+        FROM    tmp_acct_info t1
+                ,pd_data.act_am_ccrc_acct_info_his t2
+        WHERE   t1.acct_type = '资管'
+        AND     t2.eff_date <= {{ end_date }}
+        AND     t2.end_date > {{ end_date }}
+        AND     t1.ccrc_acct_id = t2.ccrc_acct_id
+    );
+    -- 资管账号持有人
+    DROP TABLE IF EXISTS tmp_acct_am_holder1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_am_holder1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  t2.source_grp
+                ,t2.acct_id
+                ,t2.ccrc_acct_id
+                ,t1.holder_id_card_type         -- 持有人证件号类型
+                ,t1.holder_id_card              -- 持有人证件号
+        FROM    pd_data.act_am_vol_holder_info t1
+                ,tmp_acct_info t2
+        WHERE   t1.data_date = {{ end_date }}
+        AND     t2.acct_type = '资管'
+        AND     (t1.instr_acct_type='01' AND t1.instr_ccrc_acct_id = t2.ccrc_acct_id
+                OR t1.instr_acct_type='02' AND t1.instr_acct_id = t2.acct_id
+                )
+    );
+    DROP TABLE IF EXISTS tmp_acct_am_holder2;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_am_holder2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  DISTINCT
+                t1.source_grp
+                ,t1.acct_id
+                ,t1.ccrc_acct_id
+                ,t1.holder_id_card_type                         -- 持有人证件号类型
+                ,t1.holder_id_card                              -- 持有人证件号
+                ,t2.ccrc_acct_id AS holder_ccrc_acct_id
+                ,t2.acct_type AS holder_acct_type               -- 0:个人
+                ,(CASE
+                    WHEN LENGTH(t2.address)<=6 THEN ''
+                    WHEN t2.address IN ('接口填写','不寄送','默认地址','无','客户地址不详','1','0','不详','未设置','不祥','0000','00','*','000000','待确认') THEN ''
+                    ELSE t2.address
+                END) AS address
+                ,(CASE
+                    WHEN LENGTH(t2.id_card_addr)<=6 THEN ''
+                    WHEN t2.id_card_addr IN ('接口填写','不寄送','默认地址','无','客户地址不详','1','0','不详','未设置','不祥','0000','00','*','000000','待确认') THEN ''
+                    ELSE t2.id_card_addr
+                END)   AS id_card_addr
+                ,(CASE
+                    WHEN LENGTH(t2.mobile)<=6 THEN ''
+                    ELSE t2.mobile
+                END) AS mobile
+                ,(CASE
+                    WHEN LENGTH(t2.telephone)<=6 THEN ''
+                    ELSE telephone
+                END) AS telephone
+                --,t2.mobile
+                --,t2.telephone
+                --,DECODE(t2.address,'不寄送','','不详','','接口填写','',NULL,'',t2.address) AS address
+                --,DECODE(t2.id_card_addr,'不寄送','','不详','','接口填写','',NULL,'',t2.id_card_addr) AS id_card_addr
+        FROM    tmp_acct_am_holder1 t1
+        LEFT JOIN
+                sd_view.act_acct_info_his t2
+        ON      t2.eff_date<='20190705'
+        AND     t2.end_date>'20190705'
+        AND     t1.holder_id_card_type = t2.id_card_type
+        AND     t1.holder_id_card = t2.id_card
+    );
+    DROP TABLE IF EXISTS tmp_acct_am_holder3;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_am_holder3
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT
+                    source_grp
+                    ,acct_id
+                    ,ccrc_acct_id
+                    ,holder_id_card_type
+                    ,holder_id_card
+                    --,holder_ccrc_acct_id
+                    --,holder_acct_type
+                    ,mobile AS phone
+            FROM    tmp_acct_am_holder2
+            WHERE   mobile <> ''
+            UNION
+            SELECT  DISTINCT
+                    source_grp
+                    ,acct_id
+                    ,ccrc_acct_id
+                    ,holder_id_card_type
+                    ,holder_id_card
+                    --,holder_ccrc_acct_id
+                    --,holder_acct_type
+                    ,telephone AS phone
+            FROM    tmp_acct_am_holder2
+            WHERE   telephone <> ''
+        )
+        ,t2 AS (
+            SELECT  DISTINCT
+                    source_grp
+                    ,acct_id
+                    ,ccrc_acct_id
+                    ,holder_id_card_type
+                    ,holder_id_card
+                    --,holder_ccrc_acct_id
+                    --,holder_acct_type
+                    ,address
+            FROM    tmp_acct_am_holder2
+            WHERE   address <> ''
+            UNION
+            SELECT  DISTINCT
+                    source_grp
+                    ,acct_id
+                    ,ccrc_acct_id
+                    ,holder_id_card_type
+                    ,holder_id_card
+                    --,holder_ccrc_acct_id
+                    --,holder_acct_type
+                    ,id_card_addr AS address
+            FROM    tmp_acct_am_holder2
+            WHERE   id_card_addr <> ''
+        )
+        SELECT  t1.*,t2.address
+        FROM    t1,t2
+        WHERE   t1.source_grp = t2.source_grp
+        AND     t1.acct_id = t2.acct_id
+    );
+    -- 劣后级资管账户
+    DROP TABLE IF EXISTS tmp_acct_am_liehou;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_am_liehou
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  DISTINCT
+                source_grp
+                ,acct_id
+                ,ccrc_acct_id
+        FROM    tmp_acct_am_holder2
+        WHERE   holder_acct_type = '0'
+    );
+
+    -- 自然人之间关联
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+       SELECT  a.source_grp
+               ,a.acct_id AS acct_id_1
+               ,b.acct_id AS acct_id_2
+               ,(CASE
+                   WHEN a.phone = b.phone AND a.phone <> '' THEN a.phone
+                   ELSE ''
+               END) AS phone
+               ,(CASE
+                   WHEN a.address = b.address AND TRIM(a.address) <> '' THEN a.address
+                   ELSE ''
+               END) AS address
+               ,(CASE
+                   WHEN a.phone = b.phone AND a.phone <> '' THEN 1
+                   ELSE 0
+               END) AS relation_phone
+               ,(CASE
+                   WHEN a.address = b.address AND TRIM(a.address) <> '' THEN 1
+                   ELSE 0
+               END) AS relation_addr
+       FROM    tmp_acct_info_all a
+               ,tmp_acct_info_all b
+       WHERE   a.acct_type = '个人'
+       AND     b.acct_type = '个人'
+       AND     a.source_grp = b.source_grp
+       AND     a.acct_id < b.acct_id
+       AND     (a.phone = b.phone AND a.phone <> ''
+               OR a.address = b.address AND TRIM(a.address) <> ''
+               )
+    );
+
+    DROP TABLE IF EXISTS tmp_acct_relation_gr;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_phone) AS gr_relation_phone
+                ,MAX(relation_addr) AS gr_relation_addr
+        FROM    tmp_acct_relation_gr_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 机构账户之间关联
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN a.legal_repr_id_card = b.legal_repr_id_card and a.legal_repr_id_card <> '' THEN a.legal_repr_id_card
+                    ELSE ''
+                END) AS legal_repr_id_card
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN a.phone
+                    ELSE ''
+                END) AS phone
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN a.address
+                    ELSE ''
+                END) AS address
+
+                ,(CASE
+                    WHEN a.legal_repr_id_card = b.legal_repr_id_card and a.legal_repr_id_card <> ''  THEN 1
+                    ELSE 0
+                END) AS relation_legal
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN 1
+                    ELSE 0
+                END) AS relation_phone
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN 1
+                    ELSE 0
+                END) AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,tmp_acct_info_all b
+        WHERE   a.acct_type = '机构'
+        AND     b.acct_type = '机构'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     (a.phone = b.phone AND a.phone <> ''
+                OR a.address = b.address AND TRIM(a.address) <> ''
+                OR  a.legal_repr_id_card = b.legal_repr_id_card AND a.legal_repr_id_card <> ''
+                )
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_jg;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_legal) AS jg_relation_legal
+                ,MAX(relation_phone) AS jg_relation_phone
+                ,MAX(relation_addr) AS jg_relation_addr
+        FROM    tmp_acct_relation_jg_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 自然人账户与机构账户之间
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_jg_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_jg_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN a.id_card = b.legal_repr_id_card AND a.legal_repr_id_card <> '' THEN a.id_card
+                    ELSE ''
+                END) AS id_card
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN a.phone
+                    ELSE ''
+                END) AS phone
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN a.address
+                    ELSE ''
+                END) AS address
+                ,(CASE
+                    WHEN a.id_card = b.legal_repr_id_card AND a.legal_repr_id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_id_legal
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN 1
+                    ELSE 0
+                END) AS relation_phone
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN 1
+                    ELSE 0
+                END) AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,tmp_acct_info_all b
+        WHERE   a.acct_type = '个人'
+        AND     b.acct_type = '机构'
+        AND     a.source_grp = b.source_grp
+        AND     (a.id_card = b.legal_repr_id_card AND a.legal_repr_id_card <> ''
+                OR a.phone = b.phone AND a.phone <> ''
+                OR a.address = b.address AND TRIM(a.address) <> ''
+                )
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_jg;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_jg
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_id_legal) AS gr_jg_relation_id_legal
+                ,MAX(relation_phone) AS gr_jg_relation_phone
+                ,MAX(relation_addr) AS gr_jg_relation_addr
+        FROM    tmp_acct_relation_gr_jg_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 资管账户之间
+    -- 投资顾问一致、投资顾问代表一致、账户实际操作人一致
+    DROP TABLE IF EXISTS tmp_acct_relation_zg1_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_zg1_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  t1.source_grp
+                ,t1.acct_id AS acct_id_1
+                ,t2.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN t1.invest_cnsltnt_id_card = t2.invest_cnsltnt_id_card AND t1.invest_cnsltnt_id_card <> '' THEN t1.invest_cnsltnt_id_card
+                    ELSE ''
+                END) AS invest_cnsltnt_id_card                                          -- 投资顾问一致
+                ,(CASE
+                    WHEN t1.cnsltnt_rep_id_card = t2.cnsltnt_rep_id_card AND t1.cnsltnt_rep_id_card <> '' THEN t1.cnsltnt_rep_id_card
+                    ELSE ''
+                END) AS cnsltnt_rep_id_card                                             -- 投资顾问代表一致
+                ,(CASE
+                    WHEN t1.actl_operator_id_card = t2.actl_operator_id_card AND t1.actl_operator_id_card <> '' THEN t1.actl_operator_id_card
+                    ELSE ''
+                END) AS actl_operator_id_card                                           -- 账户实际操作人一致
+                ,(CASE
+                    WHEN t1.invest_cnsltnt_id_card = t2.invest_cnsltnt_id_card AND t1.invest_cnsltnt_id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_invest_cnsltnt                                         -- 投资顾问一致
+                ,(CASE
+                    WHEN t1.cnsltnt_rep_id_card = t2.cnsltnt_rep_id_card AND t1.cnsltnt_rep_id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_cnsltnt_rep                                            -- 投资顾问代表一致
+                ,(CASE
+                    WHEN t1.actl_operator_id_card = t2.actl_operator_id_card AND t1.actl_operator_id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_actl_operator                                          -- 账户实际操作人一致
+        FROM    tmp_acct_am_info t1
+                ,tmp_acct_am_info t2
+        WHERE   t1.source_grp = t2.source_grp
+        AND     t1.acct_id < t2.acct_id
+        AND     (t1.invest_cnsltnt_id_card = t2.invest_cnsltnt_id_card AND t1.invest_cnsltnt_id_card <> ''
+                OR t1.cnsltnt_rep_id_card = t2.cnsltnt_rep_id_card AND t1.cnsltnt_rep_id_card <> ''
+                OR t1.actl_operator_id_card = t2.actl_operator_id_card AND t1.actl_operator_id_card <> ''
+                )
+    );
+
+    DROP TABLE IF EXISTS tmp_acct_relation_zg1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_zg1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_invest_cnsltnt) AS relation_invest_cnsltnt
+                ,MAX(relation_cnsltnt_rep) AS relation_cnsltnt_rep
+                ,MAX(relation_actl_operator) AS relation_actl_operator
+        FROM    tmp_acct_relation_zg1_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 劣后级:投资委托人或投资受益人存在一致情形、投资委托人或投资受益人联系电话一致、投资委托人或投资受益人联系地址一致
+    DROP TABLE IF EXISTS tmp1;
+    CREATE LOCAL TEMPORARY TABLE tmp1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id)
+    AS (
+        SELECT  DISTINCT a.source_grp
+                ,a.acct_id
+                ,b.holder_id_card
+                ,b.phone
+                ,b.address
+        FROM    tmp_acct_am_liehou a
+                ,tmp_acct_am_holder3 b
+        WHERE   a.source_grp = b.source_grp
+        AND     a.acct_id = b.acct_id
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_zg2_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_zg2_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT source_grp,acct_id,holder_id_card
+            FROM    tmp1
+            WHERE   holder_id_card <> ''
+        )
+        ,t2 AS (
+            SELECT  DISTINCT source_grp,acct_id,phone
+            FROM    tmp1
+            WHERE   phone <> ''
+        )
+        ,t3 AS (
+            SELECT  DISTINCT source_grp,acct_id,address
+            FROM    tmp1
+            WHERE   address <> ''
+        )
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,a.holder_id_card
+                ,'' AS phone
+                ,'' AS address
+                ,1 AS relation_holder
+                ,0 AS relation_phone
+                ,0 AS relation_addr
+        FROM    t1 a
+                ,t1 b
+        WHERE   a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.holder_id_card = b.holder_id_card
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' AS holder_id_card
+                ,a.phone
+                ,'' AS address
+                ,0 AS relation_holder
+                ,1 AS relation_phone
+                ,0 AS relation_addr
+        FROM    t2 a
+                ,t2 b
+        WHERE   a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.phone = b.phone
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' AS holder_id_card
+                ,'' AS phone
+                ,a.address
+                ,0 AS relation_holder
+                ,0 AS relation_phone
+                ,1 AS relation_addr
+        FROM    t3 a
+                ,t3 b
+        WHERE   a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.address = b.address
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_zg2;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_zg2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_holder) AS relation_holder
+                ,MAX(relation_phone) AS relation_phone
+                ,MAX(relation_addr) AS relation_addr
+        FROM    tmp_acct_relation_zg2_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_zg;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_zg
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t0 AS (
+            SELECT  DISTINCT source_grp
+                    ,acct_id
+            FROM    tmp_acct_am_info
+        )
+        SELECT  t1.source_grp
+                ,t1.acct_id AS acct_id_1
+                ,t2.acct_id AS acct_id_2
+                ,COALESCE(t3.relation_invest_cnsltnt,0) AS zg_relation_invest_cnsltnt           -- 投资顾问一致
+                ,COALESCE(t3.relation_cnsltnt_rep,0) AS zg_relation_cnsltnt_rep                 -- 投资顾问代表一致
+                ,COALESCE(t3.relation_actl_operator,0) AS zg_relation_actl_operator             -- 账户实际操作人一致
+                ,COALESCE(t4.relation_holder,0) AS zg_relation_holder                           -- （劣后级）投资委托人或投资受益人存在一致情形
+                ,COALESCE(t4.relation_phone,0) AS zg_relation_phone                             -- （劣后级）投资委托人或投资受益人联系电话一致
+                ,COALESCE(t4.relation_addr,0) AS zg_relation_addr                               -- （劣后级）投资委托人或投资受益人联系地址一致
+        FROM    t0 t1
+        INNER JOIN
+                t0 t2
+        ON      t1.source_grp = t2.source_grp
+        AND     t1.acct_id < t2.acct_id
+        LEFT JOIN
+                tmp_acct_relation_zg1 t3
+        ON      t1.source_grp = t3.source_grp
+        AND     t1.acct_id = t3.acct_id_1
+        AND     t2.source_grp = t3.source_grp
+        AND     t2.acct_id = t3.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_zg2 t4
+        ON      t1.source_grp = t4.source_grp
+        AND     t1.acct_id = t4.acct_id_1
+        AND     t2.source_grp = t4.source_grp
+        AND     t2.acct_id = t4.acct_id_2
+        WHERE   GREATEST(t3.relation_invest_cnsltnt,t3.relation_cnsltnt_rep,t3.relation_actl_operator,t4.relation_holder,t4.relation_phone,t4.relation_addr) = 1
+    );
+    -- 自然人账户与资管产品账户之间
+    -- 自然人账户持有人与资管产品账户投资顾问代表一致、自然人账户持有人与资管产品账户实际操作人一致
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg1_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg1_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,a.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN a.id_card = b.cnsltnt_rep_id_card and a.id_card <> '' THEN a.id_card
+                    ELSE ''
+                END) AS cnsltnt_rep_id_card                                         -- 自然人账户持有人与资管产品账户投资顾问代表一致
+                ,(CASE
+                    WHEN a.id_card = b.actl_operator_id_card and a.id_card <> '' THEN a.id_card
+                    ELSE ''
+                END) AS actl_operator_id_card                                       -- 自然人账户持有人与资管产品账户实际操作人一致
+                ,(CASE
+                    WHEN a.id_card = b.cnsltnt_rep_id_card and a.id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_cnsltnt                                            -- 自然人账户持有人与资管产品账户投资顾问代表一致
+                ,(CASE
+                    WHEN a.id_card = b.actl_operator_id_card and a.id_card <> '' THEN 1
+                    ELSE 0
+                END) AS relation_actl_operator                                      -- 自然人账户持有人与资管产品账户实际操作人一致
+        FROM    tmp_acct_info a
+                ,tmp_acct_am_info b
+        WHERE   a.acct_type = '个人'
+        AND     a.id_card <> ''
+        AND     a.source_grp = b.source_grp
+        AND     (a.id_card = b.cnsltnt_rep_id_card
+                OR a.id_card = b.actl_operator_id_card
+                )
+    );
+
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_cnsltnt) AS relation_cnsltnt
+                ,MAX(relation_actl_operator) AS relation_actl_operator
+        FROM    tmp_acct_relation_gr_zg1_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形、自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg2_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg2_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT source_grp,acct_id,holder_id_card
+            FROM    tmp_acct_am_holder3
+            WHERE   holder_id_card <> ''
+        )
+        ,t2 AS (
+            SELECT  DISTINCT source_grp,acct_id,phone
+            FROM    tmp_acct_am_holder3
+            WHERE   phone <> ''
+        )
+        ,t3 AS (
+            SELECT  DISTINCT source_grp,acct_id,address
+            FROM    tmp_acct_am_holder3
+            WHERE   address <> ''
+        )
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,a.id_card as holder_id_card
+                ,'' as phone
+                ,'' as address
+                ,1 AS relation_holder
+                ,0 AS relation_phone
+                ,0 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t1 b
+        WHERE   a.acct_type = '个人'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.id_card = b.holder_id_card
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' as holder_id_card
+                ,a.phone
+                ,'' as address
+                ,0 AS relation_holder
+                ,1 AS relation_phone
+                ,0 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t2 b
+        WHERE   a.acct_type = '个人'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.phone = b.phone
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' as holder_id_card
+                ,'' as phone
+                ,a.address
+                ,0 AS relation_holder
+                ,0 AS relation_phone
+                ,1 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t3 b
+        WHERE   a.acct_type = '个人'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.address = b.address
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg2;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_holder) AS relation_holder
+                ,GREATEST(MAX(relation_phone),MAX(relation_addr))  AS relation_holder_kh_info
+        FROM    tmp_acct_relation_gr_zg2_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 开户信息联系电话一致、联系地址一致
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg3_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg3_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN a.phone
+                    ELSE ''
+                END) AS phone                                               -- 开户信息联系电话一致
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN a.address
+                    ELSE ''
+                END) AS address                                             -- 开户信息联系地址一致
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN 1
+                    ELSE 0
+                END) AS relation_phone                                      -- 开户信息联系电话一致
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN 1
+                    ELSE 0
+                END) AS relation_addr                                       -- 开户信息联系地址一致
+        FROM    tmp_acct_info_all a
+                ,tmp_acct_info_all b
+        WHERE   a.acct_type = '个人'
+        AND     b.acct_type = '资管'
+        AND     a.source_grp = b.source_grp
+        AND     (a.phone = b.phone AND a.phone <> ''
+                OR a.address = b.address AND TRIM(a.address) <> ''
+                )
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg3;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg3
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_phone) AS relation_phone
+                ,MAX(relation_addr) AS relation_addr
+        FROM    tmp_acct_relation_gr_zg3_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_gr_zg;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_gr_zg
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT
+                    a.source_grp
+                    ,a.acct_id AS acct_id_1
+                    ,b.acct_id AS acct_id_2
+            FROM    tmp_acct_info_all a
+                    ,tmp_acct_info_all b
+            WHERE   a.acct_type = '个人'
+            AND     b.acct_type = '资管'
+            AND     a.source_grp = b.source_grp
+        )
+        SELECT  t1.source_grp
+                ,t1.acct_id_1
+                ,t1.acct_id_2
+                ,COALESCE(t2.relation_cnsltnt,0) AS gr_zg_relation_cnsltnt                      -- 自然人账户持有人与资管产品账户投资顾问代表一致
+                ,COALESCE(t2.relation_actl_operator,0) AS gr_zg_relation_actl_operator          -- 自然人账户持有人与资管产品账户实际操作人一致
+                ,COALESCE(t3.relation_holder,0) AS gr_zg_relation_holder                        -- 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t4.relation_phone,0) AS gr_zg_relation_phone                          -- 开户信息联系电话一致
+                ,COALESCE(t4.relation_addr,0) AS gr_zg_relation_addr                            -- 开户信息联系地址一致
+                ,COALESCE(t3.relation_holder_kh_info,0) AS gr_zg_relation_holder_kh_info        -- 自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+        FROM    t1
+        LEFT JOIN
+                tmp_acct_relation_gr_zg1 t2
+        ON      t1.source_grp = t2.source_grp
+        AND     t1.acct_id_1 = t2.acct_id_1
+        AND     t1.acct_id_2 = t2.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_gr_zg2 t3
+        ON      t1.source_grp = t3.source_grp
+        AND     t1.acct_id_1 = t3.acct_id_1
+        AND     t1.acct_id_2 = t3.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_gr_zg3 t4
+        ON      t1.source_grp = t4.source_grp
+        AND     t1.acct_id_1 = t4.acct_id_1
+        AND     t1.acct_id_2 = t4.acct_id_2
+        WHERE   GREATEST(t2.relation_cnsltnt,t2.relation_actl_operator,t3.relation_holder,t4.relation_phone,t4.relation_addr,t3.relation_holder_kh_info) = 1
+    );
+
+    -- 机构与资管产品账户之间
+    -- 机构账户所属机构与资管产品账户投资顾问一致、机构账户所属机构主要负责人与资管产品账户实际操作人一致、机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg1_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg1_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+       SELECT  a.source_grp
+               ,a.acct_id AS acct_id_1
+               ,a.acct_id AS acct_id_2
+               ,(CASE
+                   WHEN a.id_card <> '' AND a.id_card = b.invest_cnsltnt_id_card THEN a.id_card
+                   ELSE ''
+               END) AS invest_cnsltnt_id_card                                      -- 机构账户持有人与资管产品账户投资顾问代表一致
+               ,(CASE
+                   WHEN a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.actl_operator_id_card THEN a.legal_repr_id_card
+                   ELSE ''
+               END) AS legal_repr_id_card                                          -- 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+               ,(CASE
+                   WHEN a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.cnsltnt_rep_id_card THEN a.legal_repr_id_card
+                   ELSE ''
+               END) AS cnsltnt_rep_id_card                                         -- 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+               ,(CASE
+                   WHEN a.id_card <> '' AND a.id_card = b.invest_cnsltnt_id_card THEN 1
+                   ELSE 0
+               END) AS relation_invest                                             -- 机构账户持有人与资管产品账户投资顾问代表一致
+               ,(CASE
+                   WHEN a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.actl_operator_id_card THEN 1
+                   ELSE 0
+               END) AS relation_actl_operator                                      -- 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+               ,(CASE
+                   WHEN a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.cnsltnt_rep_id_card THEN 1
+                   ELSE 0
+               END) AS relation_cnsltnt                                          -- 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+       FROM    tmp_acct_info a
+               ,tmp_acct_am_info b
+       WHERE   a.acct_type = '机构'
+       AND     a.source_grp = b.source_grp
+       AND     (a.id_card <> '' AND a.id_card = b.invest_cnsltnt_id_card
+               OR a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.cnsltnt_rep_id_card
+               OR a.legal_repr_id_card <> '' AND a.legal_repr_id_card = b.actl_operator_id_card
+               )
+    );
+
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg1;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg1
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_invest) AS relation_invest                          -- 机构账户持有人与资管产品账户投资顾问代表一致
+                ,MAX(relation_actl_operator) AS relation_actl_operator            -- 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+                ,MAX(relation_cnsltnt) AS relation_cnsltnt                        -- 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+        FROM    tmp_acct_relation_jg_zg1_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形、机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg2_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg2_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT source_grp,acct_id,holder_id_card
+            FROM    tmp_acct_am_holder3
+            WHERE   holder_id_card <> ''
+        )
+        ,t2 AS (
+            SELECT  DISTINCT source_grp,acct_id,phone
+            FROM    tmp_acct_am_holder3
+            WHERE   phone <> ''
+        )
+        ,t3 AS (
+            SELECT  DISTINCT source_grp,acct_id,address
+            FROM    tmp_acct_am_holder3
+            WHERE   address <> ''
+        )
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,a.legal_repr_id_card AS holder_id_card
+                ,'' AS phone
+                ,'' AS address
+                ,1 AS relation_holder
+                ,0 AS relation_phone
+                ,0 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t1 b
+        WHERE   a.acct_type = '机构'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.legal_repr_id_card = b.holder_id_card
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' AS holder_id_card
+                ,a.phone
+                ,'' AS address
+                ,0 AS relation_holder
+                ,1 AS relation_phone
+                ,0 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t2 b
+        WHERE   a.acct_type = '机构'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.phone = b.phone
+        UNION ALL
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,'' AS holder_id_card
+                ,'' AS phone
+                ,a.address
+                ,0 AS relation_holder
+                ,0 AS relation_phone
+                ,1 AS relation_addr
+        FROM    tmp_acct_info_all a
+                ,t3 b
+        WHERE   a.acct_type = '机构'
+        AND     a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.address = b.address
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg2;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg2
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_holder) AS relation_holder
+                ,GREATEST(MAX(relation_phone),MAX(relation_addr))  AS relation_holder_kh_info
+        FROM    tmp_acct_relation_jg_zg2_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    -- 开户信息联系电话一致、联系地址一致
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg3_detail;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg3_detail
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN a.phone
+                    ELSE ''
+                END) AS phone                                               -- 开户信息联系电话一致
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN a.address
+                    ELSE ''
+                END) AS address                                             -- 开户信息联系地址一致
+                ,(CASE
+                    WHEN a.phone = b.phone AND a.phone <> '' THEN 1
+                    ELSE 0
+                END) AS relation_phone                                      -- 开户信息联系电话一致
+                ,(CASE
+                    WHEN a.address = b.address AND TRIM(a.address) <> '' THEN 1
+                    ELSE 0
+                END) AS relation_addr                                       -- 开户信息联系地址一致
+        FROM    tmp_acct_info_all a
+                ,tmp_acct_info_all b
+        WHERE   a.acct_type = '机构'
+        AND     b.acct_type = '资管'
+        AND     a.source_grp = b.source_grp
+        AND     (a.phone = b.phone AND a.phone <> ''
+                OR a.address = b.address AND TRIM(a.address) <> ''
+                )
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg3;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg3
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  source_grp
+                ,acct_id_1
+                ,acct_id_2
+                ,MAX(relation_phone) AS relation_phone
+                ,MAX(relation_addr) AS relation_addr
+        FROM    tmp_acct_relation_jg_zg3_detail
+        GROUP BY
+                source_grp
+                ,acct_id_1
+                ,acct_id_2
+    );
+    DROP TABLE IF EXISTS tmp_acct_relation_jg_zg;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_jg_zg
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  DISTINCT
+                    a.source_grp
+                    ,a.acct_id AS acct_id_1
+                    ,b.acct_id AS acct_id_2
+            FROM    tmp_acct_info_all a
+                    ,tmp_acct_info_all b
+            WHERE   a.acct_type = '机构'
+            AND     b.acct_type = '资管'
+            AND     a.source_grp = b.source_grp
+        )
+        SELECT  t1.source_grp
+                ,t1.acct_id_1
+                ,t1.acct_id_2
+                ,COALESCE(t2.relation_invest,0) AS jg_zg_relation_invest                        -- 机构账户所属机构与资管产品账户投资顾问一致
+                ,COALESCE(t3.relation_holder,0) AS jg_zg_relation_holder                        -- 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t2.relation_actl_operator,0) AS jg_zg_relation_actl_operator          -- 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+                ,COALESCE(t2.relation_cnsltnt,0) AS jg_zg_relation_cnsltnt                      -- 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+                ,COALESCE(t4.relation_phone,0) AS jg_zg_relation_phone                          -- 开户信息联系电话一致
+                ,COALESCE(t4.relation_addr,0) AS jg_zg_relation_addr                            -- 开户信息联系地址一致
+                ,COALESCE(t3.relation_holder_kh_info,0) AS jg_zg_relation_holder_kh_info        -- 机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+        FROM    t1
+        LEFT JOIN
+                tmp_acct_relation_jg_zg1 t2
+        ON      t1.source_grp = t2.source_grp
+        AND     t1.acct_id_1 = t2.acct_id_1
+        AND     t1.acct_id_2 = t2.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_jg_zg2 t3
+        ON      t1.source_grp = t3.source_grp
+        AND     t1.acct_id_1 = t3.acct_id_1
+        AND     t1.acct_id_2 = t3.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_jg_zg3 t4
+        ON      t1.source_grp = t4.source_grp
+        AND     t1.acct_id_1 = t4.acct_id_1
+        AND     t1.acct_id_2 = t4.acct_id_2
+        WHERE   GREATEST(t2.relation_invest,t3.relation_holder,t2.relation_actl_operator,t2.relation_cnsltnt,t4.relation_phone,t4.relation_addr,t3.relation_holder_kh_info) = 1
+    );
+
+    -- 5级关联
+    DROP TABLE IF EXISTS tmp_acct_relation_lvl_5;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_lvl_5
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  a.source_grp
+                    ,a.acct_id AS acct_id_1
+                    ,b.acct_id AS acct_id_2
+            FROM    param_physical_relation_acct a
+                    ,param_physical_relation_acct b
+            WHERE   a.source_grp = b.source_grp
+            AND     a.acct_id <> b.acct_id
+        )
+        SELECT  t1.source_grp
+                ,t1.acct_id_1
+                ,t1.acct_id_2
+                ,5 AS relation_level
+                ,COALESCE(t2.gr_relation_phone,0) AS gr_relation_phone                              -- 自然人账户之间: 开户信息联系电话一致
+                ,COALESCE(t2.gr_relation_addr,0) AS gr_relation_addr                                -- 自然人账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.jg_relation_legal,0) AS jg_relation_legal                              -- 机构账户之间: 机构主要负责人身份一致
+                ,COALESCE(t3.jg_relation_phone,0) AS jg_relation_phone                              -- 机构账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.jg_relation_addr,0) AS jg_relation_addr                                -- 机构账户之间: 开户信息联系地址一致
+                ,COALESCE(t4.gr_jg_relation_id_legal,0) AS gr_jg_relation_id_legal                  -- 自然人账户与机构账户之间: 所属机构主要负责人身份一致
+                ,COALESCE(t4.gr_jg_relation_phone,0) AS gr_jg_relation_phone                        -- 自然人账户与机构账户之间: 开户信息联系电话一致
+                ,COALESCE(t4.gr_jg_relation_addr,0) AS gr_jg_relation_addr                          -- 自然人账户与机构账户之间: 开户信息联系地址一致
+                ,COALESCE(t5.zg_relation_invest_cnsltnt,0) AS zg_relation_invest_cnsltnt            -- 资管产品之间: 投资顾问一致
+                ,COALESCE(t5.zg_relation_cnsltnt_rep,0) AS zg_relation_cnsltnt_rep                  -- 资管产品之间: 投资顾问代表一致
+                ,COALESCE(t5.zg_relation_actl_operator,0) AS zg_relation_actl_operator              -- 资管产品之间: 账户实际操作人一致
+                ,COALESCE(t5.zg_relation_holder,0) AS zg_relation_holder                            -- 资管产品之间: （劣后级）投资委托人或投资受益人存在一致情形
+                ,COALESCE(t5.zg_relation_phone,0) AS zg_relation_phone                              -- 资管产品之间: （劣后级）投资委托人或投资受益人联系电话一致
+                ,COALESCE(t5.zg_relation_addr,0) AS zg_relation_addr                                -- 资管产品之间: （劣后级）投资委托人或投资受益人联系地址一致
+                ,COALESCE(t6.gr_zg_relation_cnsltnt,0) AS gr_zg_relation_cnsltnt                    -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资顾问代表一致
+                ,COALESCE(t6.gr_zg_relation_actl_operator,0) AS gr_zg_relation_actl_operator        -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户实际操作人一致
+                ,COALESCE(t6.gr_zg_relation_holder,0) AS gr_zg_relation_holder                      -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t6.gr_zg_relation_phone,0) AS gr_zg_relation_phone                        -- 自然人账户与资管产品账户之间: 开户信息联系电话一致
+                ,COALESCE(t6.gr_zg_relation_addr,0) AS gr_zg_relation_addr                          -- 自然人账户与资管产品账户之间: 开户信息联系地址一致
+                ,COALESCE(t6.gr_zg_relation_holder_kh_info,0) AS gr_zg_relation_holder_kh_info      -- 自然人账户与资管产品账户之间: 自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+                ,COALESCE(t7.jg_zg_relation_invest,0) AS jg_zg_relation_invest                      -- 机构账户与资管产品账户之间: 机构账户所属机构与资管产品账户投资顾问一致
+                ,COALESCE(t7.jg_zg_relation_holder,0) AS jg_zg_relation_holder                      -- 机构账户与资管产品账户之间: 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t7.jg_zg_relation_actl_operator,0) AS jg_zg_relation_actl_operator        -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+                ,COALESCE(t7.jg_zg_relation_cnsltnt,0) AS jg_zg_relation_cnsltnt                    -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+                ,COALESCE(t7.jg_zg_relation_phone,0) AS jg_zg_relation_phone                        -- 机构账户与资管产品账户之间: 开户信息联系电话一致
+                ,COALESCE(t7.jg_zg_relation_addr,0) AS jg_zg_relation_addr                          -- 机构账户与资管产品账户之间: 开户信息联系地址一致
+                ,COALESCE(t7.jg_zg_relation_holder_kh_info,0) AS jg_zg_relation_holder_kh_info      -- 机构账户与资管产品账户之间: 机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+        FROM    t1
+        LEFT JOIN
+                tmp_acct_relation_gr t2
+        ON      t1.source_grp = t2.source_grp
+        AND     t1.acct_id_1 = t2.acct_id_1
+        AND     t1.acct_id_2 = t2.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_jg t3
+        ON      t1.source_grp = t3.source_grp
+        AND     t1.acct_id_1 = t3.acct_id_1
+        AND     t1.acct_id_2 = t3.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_gr_jg t4
+        ON      t1.source_grp = t4.source_grp
+        AND     t1.acct_id_1 = t4.acct_id_1
+        AND     t1.acct_id_2 = t4.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_zg t5
+        ON      t1.source_grp = t5.source_grp
+        AND     t1.acct_id_1 = t5.acct_id_1
+        AND     t1.acct_id_2 = t5.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_gr_zg t6
+        ON      t1.source_grp = t6.source_grp
+        AND     t1.acct_id_1 = t6.acct_id_1
+        AND     t1.acct_id_2 = t6.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_jg_zg t7
+        ON      t1.source_grp = t7.source_grp
+        AND     t1.acct_id_1 = t7.acct_id_1
+        AND     t1.acct_id_2 = t7.acct_id_2
+        WHERE   GREATEST(t2.gr_relation_phone,t2.gr_relation_addr,t3.jg_relation_legal,t3.jg_relation_phone,t3.jg_relation_addr
+                    ,t4.gr_jg_relation_id_legal,t4.gr_jg_relation_phone,t4.gr_jg_relation_addr,t5.zg_relation_invest_cnsltnt
+                    ,t5.zg_relation_cnsltnt_rep,t5.zg_relation_actl_operator,t5.zg_relation_holder,t5.zg_relation_phone,t5.zg_relation_addr
+                    ,t6.gr_zg_relation_cnsltnt,t6.gr_zg_relation_actl_operator,t6.gr_zg_relation_holder,t6.gr_zg_relation_phone,t6.gr_zg_relation_addr
+                    ,t6.gr_zg_relation_holder_kh_info,t7.jg_zg_relation_invest,t7.jg_zg_relation_holder,t7.jg_zg_relation_actl_operator
+                    ,t7.jg_zg_relation_cnsltnt,t7.jg_zg_relation_phone,t7.jg_zg_relation_addr,t7.jg_zg_relation_holder_kh_info) = 1
+    );
+
+    -- 6级关联
+    DROP TABLE IF EXISTS tmp_acct_relation_lvl_6;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_relation_lvl_6
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        SELECT  a.source_grp
+                ,a.acct_id AS acct_id_1
+                ,b.acct_id AS acct_id_2
+                ,6 AS relation_level
+                ,a.ccrc_acct_id
+        FROM    tmp_acct_info a
+                ,tmp_acct_info b
+        WHERE   a.source_grp = b.source_grp
+        AND     a.acct_id < b.acct_id
+        AND     a.ccrc_acct_id = b.ccrc_acct_id
+    );
+
+
+    -- 合并全部物理关联
+    DROP TABLE IF EXISTS tmp_acct_pysical_relation;
+    CREATE LOCAL TEMPORARY TABLE tmp_acct_pysical_relation
+        WITH (ORIENTATION = COLUMN)
+        DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+    AS (
+        WITH t1 AS (
+            SELECT  a.source_grp
+                    ,a.acct_id AS acct_id_1
+                    ,b.acct_id AS acct_id_2
+            FROM    param_physical_relation_acct a
+                    ,param_physical_relation_acct b
+            WHERE   a.acct_id <> b.acct_id
+            AND     a.source_grp = b.source_grp
+        )
+        SELECT  t1.acct_id_1
+                ,t1.acct_id_2
+                ,GREATEST(t2.relation_level,t3.relation_level,t4.relation_level) AS relation_level  -- 物理关联级别
+                ,COALESCE(t2.device_relation,0) AS device_relation                                  -- 期间用过同一终端信息
+                ,COALESCE(t3.gr_relation_phone,0) AS gr_relation_phone                              -- 自然人账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.gr_relation_addr,0) AS gr_relation_addr                                -- 自然人账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.jg_relation_legal,0) AS jg_relation_legal                              -- 机构账户之间: 机构主要负责人身份一致
+                ,COALESCE(t3.jg_relation_phone,0) AS jg_relation_phone                              -- 机构账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.jg_relation_addr,0) AS jg_relation_addr                                -- 机构账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.gr_jg_relation_id_legal,0) AS gr_jg_relation_id_legal                  -- 自然人账户与机构账户之间: 所属机构主要负责人身份一致
+                ,COALESCE(t3.gr_jg_relation_phone,0) AS gr_jg_relation_phone                        -- 自然人账户与机构账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.gr_jg_relation_addr,0) AS gr_jg_relation_addr                          -- 自然人账户与机构账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.zg_relation_invest_cnsltnt,0) AS zg_relation_invest_cnsltnt            -- 资管产品之间: 投资顾问一致
+                ,COALESCE(t3.zg_relation_cnsltnt_rep,0) AS zg_relation_cnsltnt_rep                  -- 资管产品之间: 投资顾问代表一致
+                ,COALESCE(t3.zg_relation_actl_operator,0) AS zg_relation_actl_operator              -- 资管产品之间: 账户实际操作人一致
+                ,COALESCE(t3.zg_relation_holder,0) AS zg_relation_holder                            -- 资管产品之间: （劣后级）投资委托人或投资受益人存在一致情形
+                ,COALESCE(t3.zg_relation_phone,0) AS zg_relation_phone                              -- 资管产品之间: （劣后级）投资委托人或投资受益人联系电话一致
+                ,COALESCE(t3.zg_relation_addr,0) AS zg_relation_addr                                -- 资管产品之间: （劣后级）投资委托人或投资受益人联系地址一致
+                ,COALESCE(t3.gr_zg_relation_cnsltnt,0) AS gr_zg_relation_cnsltnt                    -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资顾问代表一致
+                ,COALESCE(t3.gr_zg_relation_actl_operator,0) AS gr_zg_relation_actl_operator        -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户实际操作人一致
+                ,COALESCE(t3.gr_zg_relation_holder,0) AS gr_zg_relation_holder                      -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t3.gr_zg_relation_phone,0) AS gr_zg_relation_phone                        -- 自然人账户与资管产品账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.gr_zg_relation_addr,0) AS gr_zg_relation_addr                          -- 自然人账户与资管产品账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.gr_zg_relation_holder_kh_info,0) AS gr_zg_relation_holder_kh_info      -- 自然人账户与资管产品账户之间: 自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+                ,COALESCE(t3.jg_zg_relation_invest,0) AS jg_zg_relation_invest                      -- 机构账户与资管产品账户之间: 机构账户所属机构与资管产品账户投资顾问一致
+                ,COALESCE(t3.jg_zg_relation_holder,0) AS jg_zg_relation_holder                      -- 机构账户与资管产品账户之间: 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形
+                ,COALESCE(t3.jg_zg_relation_actl_operator,0) AS jg_zg_relation_actl_operator        -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+                ,COALESCE(t3.jg_zg_relation_cnsltnt,0) AS jg_zg_relation_cnsltnt                    -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+                ,COALESCE(t3.jg_zg_relation_phone,0) AS jg_zg_relation_phone                        -- 机构账户与资管产品账户之间: 开户信息联系电话一致
+                ,COALESCE(t3.jg_zg_relation_addr,0) AS jg_zg_relation_addr                          -- 机构账户与资管产品账户之间: 开户信息联系地址一致
+                ,COALESCE(t3.jg_zg_relation_holder_kh_info,0) AS jg_zg_relation_holder_kh_info      -- 机构账户与资管产品账户之间: 机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+                ,(CASE
+                    WHEN t4.ccrc_acct_id IS NULL THEN 0
+                    ELSE 1
+                END) AS relation_ccrc
+        FROM    t1
+        LEFT JOIN
+                tmp_acct_relation_device_merge t2
+        ON      t1.acct_id_1 = t2.acct_id_1
+        AND     t1.acct_id_2 = t2.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_lvl_5 t3
+        ON      t1.acct_id_1 = t3.acct_id_1
+        AND     t1.acct_id_2 = t3.acct_id_2
+        LEFT JOIN
+                tmp_acct_relation_lvl_6 t4
+        ON      t1.acct_id_1 = t4.acct_id_1
+        AND     t1.acct_id_2 = t4.acct_id_2
+        WHERE   GREATEST(t2.relation_level,t3.relation_level,t4.relation_level) > 0
+    );
+
+
+
+-------------------------------------------
+-- 以下代码专用一组账户，因此暂时剔除source_grp字段
+-- 结果表1：账户分组
+
+-- 账户IP组号(2级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_2
+    WHERE   device_type = 'IP'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_2_ip');
+-- 账户MAC组号(2/3级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_2
+    WHERE   device_type = 'MAC'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_2_mac');
+-- 账户电话组号(2/3级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_2
+    WHERE   device_type = 'MOBILE'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_2_telephone');
+-- 账户硬盘序列号组号(2/3级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_2
+    WHERE   device_type = 'HARDWARE'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_2_hardware');
+-- 关联级别（2级）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_2
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_2');
+-- 账户IP组号(3级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_3
+    WHERE   device_type = 'IP'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_3_ip');
+-- 关联级别（3级）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_3
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_3');
+-- 账户IP组号(4级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_4
+    WHERE   device_type = 'IP'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_4_ip');
+-- 账户MAC组号(4级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_4
+    WHERE   device_type = 'MAC'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_4_mac');
+-- 账户电话组号(4级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_4
+    WHERE   device_type = 'MOBILE'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_4_telephone');
+-- 账户硬盘序列号组号(4级)
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_4
+    WHERE   device_type = 'HARDWARE'
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_4_hardware');
+-- 关联级别（4级）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_relation_device_lvl_4
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_4');
+-- 关联级别（5级）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_acct_relation_lvl_5
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_5');
+-- 关联级别（6级）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_acct_relation_lvl_6
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_6');
+-- 物理关联并组（2级以上）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_acct_pysical_relation
+    WHERE   relation_level >= 2
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_gt_2');
+-- 物理关联并组（3级以上）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_acct_pysical_relation
+    WHERE   relation_level >= 3
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_gt_3');
+-- 物理关联并组（4级以上）
+DROP TABLE IF EXISTS tmp_relation_prepare;
+CREATE LOCAL TEMPORARY TABLE tmp_relation_prepare
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  DISTINCT
+            acct_id_1
+            ,acct_id_2
+    FROM    tmp_acct_pysical_relation
+    WHERE   relation_level >= 4
+);
+select pd_work_jcb.sp_get_acct_relation_group('param_physical_relation_acct','tmp_relation_prepare','tmp_acct_group_lvl_gt_4');
+
+-- 数据表过多，拆分成两次拼接
+DROP TABLE IF EXISTS tmp_result_acct_group1;
+CREATE TEMP TABLE tmp_result_acct_group1 AS (
+    SELECT  a.acct_id
+            ,a.acct_name
+            ,a.ccrc_acct_id
+            ,b.grp AS grp_lvl_2_ip
+            ,c.grp AS grp_lvl_2_mac
+            ,d.grp AS grp_lvl_2_telephone
+            ,e.grp AS grp_lvl_2_hardware
+            ,f.grp AS grp_lvl_2
+            ,g.grp AS grp_lvl_3_ip
+            ,h.grp AS grp_lvl_3
+    FROM    tmp_acct_info a
+    LEFT JOIN   tmp_acct_group_lvl_2_ip b
+    ON       a.acct_id = b.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_2_mac c
+    ON       a.acct_id = c.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_2_telephone d
+    ON       a.acct_id = d.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_2_hardware e
+    ON       a.acct_id = e.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_2 f
+    ON       a.acct_id = f.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_3_ip g
+    ON       a.acct_id = g.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_3 h
+    ON       a.acct_id = h.acct_id
+);
+DROP TABLE IF EXISTS tmp_result_acct_group;
+CREATE TEMP TABLE tmp_result_acct_group AS (
+    SELECT  a.*
+            ,b.grp AS grp_lvl_4_ip
+            ,c.grp AS grp_lvl_4_mac
+            ,d.grp AS grp_lvl_4_telephone
+            ,e.grp AS grp_lvl_4_hardware
+            ,f.grp AS grp_lvl_4
+            ,g.grp AS grp_lvl_5
+            ,h.grp AS grp_lvl_6
+            ,i.grp AS grp_lvl_gt_2
+            ,j.grp AS grp_lvl_gt_3
+            ,k.grp AS grp_lvl_gt_4
+            ,(CASE WHEN l.trade_vol>=1E5 THEN 1 ELSE 0 END) AS is_trade_over
+            ,COALESCE(l.buy_vol,0) AS buy_vol
+            ,COALESCE(l.sell_vol,0) AS sell_vol
+    FROM    tmp_result_acct_group1 a
+    LEFT JOIN   tmp_acct_group_lvl_4_ip b
+    ON       a.acct_id = b.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_4_mac c
+    ON       a.acct_id = c.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_4_telephone d
+    ON       a.acct_id = d.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_4_hardware e
+    ON       a.acct_id = e.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_4 f
+    ON       a.acct_id = f.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_5 g
+    ON       a.acct_id = g.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_6 h
+    ON       a.acct_id = h.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_gt_2 i
+    ON       a.acct_id = i.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_gt_3 j
+    ON       a.acct_id = j.acct_id
+    LEFT JOIN   tmp_acct_group_lvl_gt_4 k
+    ON       a.acct_id = k.acct_id
+    LEFT JOIN
+            tmp_trade l
+    ON      a.acct_id = l.acct_id
+);
+-- 结果表2：终端关联明细
+DROP TABLE IF EXISTS tmp_result_device_relation;
+CREATE LOCAL TEMPORARY TABLE tmp_result_device_relation
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  a.acct_id_1
+            ,b.acct_name AS acct_name_1
+            ,a.acct_id_2
+            ,c.acct_name AS acct_name_2
+            ,a.device_type
+            ,a.device
+            ,(CASE WHEN diff_trade_date = 0 AND is_relate_target_sec = 1 THEN 1 ELSE 0 END) AS is_same_sec_sameday
+            ,(CASE WHEN is_relate_target_sec = 1 THEN 1 ELSE 0 END) AS is_same_sec_period
+            ,(CASE WHEN diff_trade_date = 0 AND is_relate_target_sec = 0 THEN 1 ELSE 0 END) AS is_diff_sec_sameday
+            ,(CASE WHEN is_relate_target_sec = 1 THEN 1 ELSE 0 END) AS is_diff_sec_period
+            ,diff_trade_date
+            ,relation_lvl_2
+            ,relation_lvl_3
+            ,relation_lvl_4
+    FROM    tmp_relation_device_detail a
+            ,tmp_acct_info b
+            ,tmp_acct_info c
+    WHERE   a.acct_id_1 = b.acct_id
+    AND     a.acct_id_2 = c.acct_id
+);
+
+
+-- 结果表3：物理关联明细
+DROP TABLE IF EXISTS tmp_result_physical_relation_dtl;
+CREATE LOCAL TEMPORARY TABLE tmp_result_physical_relation_dtl
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    SELECT  t1.acct_id_1                                            -- 账户代码1
+            ,t2.acct_name AS acct_name_1                            -- 账户名称1
+            ,t1.acct_id_2                                           -- 账户代码2
+            ,t3.acct_name AS acct_name_2                            -- 账户名称2
+            ,t1.relation_level                                      -- 物理关联级别
+            ,t1.device_relation                                     -- 期间用过同一终端信息
+            ,t1.gr_relation_phone                                   -- 自然人账户之间: 开户信息联系电话一致
+            ,t1.gr_relation_addr                                    -- 自然人账户之间: 开户信息联系地址一致
+            ,t1.jg_relation_legal                                   -- 机构账户之间: 机构主要负责人身份一致
+            ,t1.jg_relation_phone                                   -- 机构账户之间: 开户信息联系电话一致
+            ,t1.jg_relation_addr                                    -- 机构账户之间: 开户信息联系地址一致
+            ,t1.gr_jg_relation_id_legal                             -- 自然人账户与机构账户之间: 所属机构主要负责人身份一致
+            ,t1.gr_jg_relation_phone                                -- 自然人账户与机构账户之间: 开户信息联系电话一致
+            ,t1.gr_jg_relation_addr                                 -- 自然人账户与机构账户之间: 开户信息联系地址一致
+            ,t1.zg_relation_invest_cnsltnt                          -- 资管产品之间: 投资顾问一致
+            ,t1.zg_relation_cnsltnt_rep                             -- 资管产品之间: 投资顾问代表一致
+            ,t1.zg_relation_actl_operator                           -- 资管产品之间: 账户实际操作人一致
+            ,t1.zg_relation_holder                                  -- 资管产品之间: （劣后级）投资委托人或投资受益人存在一致情形
+            ,t1.zg_relation_phone                                   -- 资管产品之间: （劣后级）投资委托人或投资受益人联系电话一致
+            ,t1.zg_relation_addr                                    -- 资管产品之间: （劣后级）投资委托人或投资受益人联系地址一致
+            ,t1.gr_zg_relation_cnsltnt                              -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资顾问代表一致
+            ,t1.gr_zg_relation_actl_operator                        -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户实际操作人一致
+            ,t1.gr_zg_relation_holder                               -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形
+            ,t1.gr_zg_relation_phone                                -- 自然人账户与资管产品账户之间: 开户信息联系电话一致
+            ,t1.gr_zg_relation_addr                                 -- 自然人账户与资管产品账户之间: 开户信息联系地址一致
+            ,t1.gr_zg_relation_holder_kh_info                       -- 自然人账户与资管产品账户之间: 自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+            ,t1.jg_zg_relation_invest                               -- 机构账户与资管产品账户之间: 机构账户所属机构与资管产品账户投资顾问一致
+            ,t1.jg_zg_relation_holder                               -- 机构账户与资管产品账户之间: 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形
+            ,t1.jg_zg_relation_actl_operator                        -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+            ,t1.jg_zg_relation_cnsltnt                              -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+            ,t1.jg_zg_relation_phone                                -- 机构账户与资管产品账户之间: 开户信息联系电话一致
+            ,t1.jg_zg_relation_addr                                 -- 机构账户与资管产品账户之间: 开户信息联系地址一致
+            ,t1.jg_zg_relation_holder_kh_info                       -- 机构账户与资管产品账户之间: 机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+            ,t1.relation_ccrc                                       -- 一码通相同
+    FROM    tmp_acct_pysical_relation t1
+    LEFT JOIN
+            tmp_acct_info t2
+    ON      t1.acct_id_1 = t2.acct_id
+    LEFT JOIN
+            tmp_acct_info t3
+    ON      t1.acct_id_2 = t3.acct_id
+);
+-- 表4:物理关联明细
+-- DROP TABLE IF EXISTS tmp_result_physical_relation_dtl;
+-- CREATE LOCAL TEMPORARY TABLE tmp_result_physical_relation_dtl
+--     WITH (ORIENTATION = COLUMN)
+--     DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+-- AS (
+--     SELECT  t1.acct_id_1                                            -- 账户代码1
+--             ,t2.acct_name AS acct_name_1                            -- 账户名称1
+--             ,t1.acct_id_2                                           -- 账户代码2
+--             ,t3.acct_name AS acct_name_2                            -- 账户名称2
+--             ,t1.relation_level                                      -- 物理关联级别
+--             ,t1.device_relation                                     -- 期间用过同一终端信息
+--             ,t1.gr_relation_phone                                   -- 自然人账户之间: 开户信息联系电话一致
+--             ,t1.gr_relation_addr                                    -- 自然人账户之间: 开户信息联系地址一致
+--             ,t1.jg_relation_legal                                   -- 机构账户之间: 机构主要负责人身份一致
+--             ,t1.jg_relation_phone                                   -- 机构账户之间: 开户信息联系电话一致
+--             ,t1.jg_relation_addr                                    -- 机构账户之间: 开户信息联系地址一致
+--             ,t1.gr_jg_relation_id_legal                             -- 自然人账户与机构账户之间: 所属机构主要负责人身份一致
+--             ,t1.gr_jg_relation_phone                                -- 自然人账户与机构账户之间: 开户信息联系电话一致
+--             ,t1.gr_jg_relation_addr                                 -- 自然人账户与机构账户之间: 开户信息联系地址一致
+--             ,t1.zg_relation_invest_cnsltnt                          -- 资管产品之间: 投资顾问一致
+--             ,t1.zg_relation_cnsltnt_rep                             -- 资管产品之间: 投资顾问代表一致
+--             ,t1.zg_relation_actl_operator                           -- 资管产品之间: 账户实际操作人一致
+--             ,t1.zg_relation_holder                                  -- 资管产品之间: （劣后级）投资委托人或投资受益人存在一致情形
+--             ,t1.zg_relation_phone                                   -- 资管产品之间: （劣后级）投资委托人或投资受益人联系电话一致
+--             ,t1.zg_relation_addr                                    -- 资管产品之间: （劣后级）投资委托人或投资受益人联系地址一致
+--             ,t1.gr_zg_relation_cnsltnt                              -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资顾问代表一致
+--             ,t1.gr_zg_relation_actl_operator                        -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户实际操作人一致
+--             ,t1.gr_zg_relation_holder                               -- 自然人账户与资管产品账户之间: 自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形
+--             ,t1.gr_zg_relation_phone                                -- 自然人账户与资管产品账户之间: 开户信息联系电话一致
+--             ,t1.gr_zg_relation_addr                                 -- 自然人账户与资管产品账户之间: 开户信息联系地址一致
+--             ,t1.gr_zg_relation_holder_kh_info                       -- 自然人账户与资管产品账户之间: 自然人账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+--             ,t1.jg_zg_relation_invest                               -- 机构账户与资管产品账户之间: 机构账户所属机构与资管产品账户投资顾问一致
+--             ,t1.jg_zg_relation_holder                               -- 机构账户与资管产品账户之间: 机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形
+--             ,t1.jg_zg_relation_actl_operator                        -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户实际操作人一致
+--             ,t1.jg_zg_relation_cnsltnt                              -- 机构账户与资管产品账户之间: 机构账户所属机构主要负责人与资管产品账户投资顾问代表一致
+--             ,t1.jg_zg_relation_phone                                -- 机构账户与资管产品账户之间: 开户信息联系电话一致
+--             ,t1.jg_zg_relation_addr                                 -- 机构账户与资管产品账户之间: 开户信息联系地址一致
+--             ,t1.jg_zg_relation_holder_kh_info                       -- 机构账户与资管产品账户之间: 机构账户开户预留电话号码或联系地址与资管产品账户投资委托人或投资受益人电话号码或联系地址存在一致情形
+--             ,t1.relation_ccrc                                       -- 一码通相同
+--     FROM    tmp_acct_pysical_relation t1
+--     LEFT JOIN
+--             tmp_acct_info t2
+--     ON      t1.acct_id_1 = t2.acct_id
+--     LEFT JOIN
+--             tmp_acct_info t3
+--     ON      t1.acct_id_2 = t3.acct_id
+-- );
+
+-- 结果表4：账户终端流水
+DROP TABLE IF EXISTS tmp_result_acct_device_all;
+CREATE LOCAL TEMPORARY TABLE tmp_result_acct_device_all
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id)
+AS (
+    WITH r1 AS (
+        SELECT  sec_code
+                ,sec_name
+                ,ROW_NUMBER() OVER(PARTITION BY sec_code ORDER BY trade_date DESC) AS rn
+        FROM    pd_data.sec_quotation_his
+        WHERE   trade_date BETWEEN {{ start_date }} AND {{ end_date }}
+        AND     sec_code LIKE '6%'
+    )
+    ,r2 AS (
+        SELECT  sec_code
+                ,sec_name
+        FROM    r1
+        WHERE   rn = 1
+    )
+    ,t3 AS (
+    SELECT  DISTINCT
+            CAST(t2.trade_date AS DATE) AS trade_date                       -- 日期
+            ,t1.acct_id                                                     -- 账户代码
+            ,t2.acct_id AS actl_acct_id                                     -- 实际账户代码
+            ,t3.acct_name AS acct_name                                      -- 账户名称
+            ,t2.sec_code                                                    -- 证券代码
+            ,t4.sec_name AS sec_name                                        -- 证券名称
+            ,t2.ip_addr                                                     -- ip地址1
+            ,t2.ip_addr2                                                    -- ip地址2
+            ,t2.mac_addr                                                    -- mac地址1
+            ,t2.mac_addr2                                                   -- mac地址2
+            ,t2.other_addr AS mobile                                        -- 手机号
+            ,t2.disk_sn AS hardware                                         -- 硬盘序列号
+    FROM    tmp_acct_cap t1
+    INNER JOIN
+            tmp_acct_cap_trade t2
+    ON      t1.mem_code_8 = t2.mem_code_8
+    AND     t1.cap_acct_id = t2.cap_acct_id
+    LEFT JOIN
+            tmp_acct_info t3
+    ON      t1.acct_id = t3.acct_id
+    LEFT JOIN
+            r2 t4
+    ON      t2.sec_code = t4.sec_code
+    )
+    SELECT  a.*
+            ,(case
+                when b.device is not null then b.device||(b.reason)||';'
+                else ''
+            end) ||
+            (case
+                when c.device is not null then c.device||(c.reason)||';'
+                else ''
+            end) ||
+            (case
+                when d.device is not null then d.device||(d.reason)||';'
+                else ''
+            end) ||
+            (case
+                when e.device is not null then e.device||(e.reason)||';'
+                else ''
+            end) ||
+            (case
+                when f.device is not null then f.device||(f.reason)||';'
+                else ''
+            end) ||
+            (case
+                when g.device is not null then g.device||(g.reason)||';'
+                else ''
+            end) as invalid_device
+    FROM    t3 a
+    LEFT JOIN
+            param_physical_relation_device_not_valid b
+    ON      a.ip_addr = b.device AND b.device_type = 'IP'
+    LEFT JOIN
+            param_physical_relation_device_not_valid c
+    ON      a.ip_addr = c.device AND c.device_type = 'IP'
+    LEFT JOIN
+            param_physical_relation_device_not_valid d
+    ON      a.mac_addr = d.device AND d.device_type = 'MAC'
+    LEFT JOIN
+            param_physical_relation_device_not_valid e
+    ON      a.mac_addr2 = e.device AND e.device_type = 'MAC'
+    LEFT JOIN
+            param_physical_relation_device_not_valid f
+    ON      a.mobile = f.device AND f.device_type = 'MOBILE'
+    LEFT JOIN
+            param_physical_relation_device_not_valid g
+    ON      a.hardware = g.device AND g.device_type = 'HARDWARE'
+);
+
+-- 结果表5：无效终端表
+DROP TABLE IF EXISTS tmp_result_invalid_device;
+CREATE TEMP TABLE tmp_result_invalid_device AS  (
+    SELECT  device_type,device,reason
+    FROM    tmp_param_physical_relation_device_not_valid
+);
+
+--------------------------------------
+-- 图结果
+
+-- 关系表（存储在neo4j中的数据，不记录组号，仅记录账户及信息节点之间的关系，用于查询图形细化的数据。使用时需要从postgres储存的数据中获取组号再拼接）
+-- 2、3、4级为递进的关联，4是3的子集，3是2的子集，这里只保留最高级别以减少数据量。查询时需要考虑该问题
+DROP TABLE IF EXISTS tmp_result_relation_info;
+CREATE TEMP TABLE tmp_result_relation_info
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id_1,acct_id_2)
+AS (
+    WITH t1 AS (
+        SELECT  DISTINCT acct_id_1,acct_id_2
+                ,device_type AS acct_info_type          -- 账户1与账户2之间关联的信息节点的类型
+                ,device AS acct_info                    -- 账户1与账户2之间关联的信息节点的值
+                ,2 AS relation_lvl                      -- 账户1与账户2的关联级别
+                ,'2级：' ||
+                    (CASE
+                        WHEN is_relate_target_sec=1 AND sec_code_1=sec_code_2 THEN '共同交易目标股票'||sec_code_1||'；'
+                        WHEN is_relate_target_sec=1 AND sec_code_1!=sec_code_2 THEN acct_id_1||'交易目标股票'||sec_code_1||','|| acct_id_2||'交易目标股票'||sec_code_2||'；'
+                        ELSE ''
+                    END) ||
+                    (CASE
+                        WHEN device_type = 'IP' AND diff_trade_date IS NOT NULL THEN '最小交易间隔'||diff_trade_date::VARCHAR||'个交易日'
+                    END)
+                AS describe                             -- 账户1与账户2的关联描述
+                ,(CASE WHEN flag_acct_id_1 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation1  -- 账户1与信息节点的关系
+                ,(CASE WHEN flag_acct_id_2 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation2  -- 账户2与信息节点的关系
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_2 = 1 AND relation_lvl_3 = 0 AND relation_lvl_4 = 0
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,device_type AS acct_info_type,device AS acct_info,3 AS relation_lvl
+                ,'3级：' ||
+                    (CASE
+                        WHEN is_relate_target_sec=1 AND sec_code_1=sec_code_2 THEN '共同交易目标股票'||sec_code_1||'；'
+                        WHEN is_relate_target_sec=1 AND sec_code_1!=sec_code_2 THEN acct_id_1||'交易目标股票'||sec_code_1||','|| acct_id_2||'交易目标股票'||sec_code_2||'；'
+                        ELSE ''
+                    END) ||
+                    (CASE
+                        WHEN device_type = 'IP' AND diff_trade_date IS NOT NULL THEN '最小交易间隔'||diff_trade_date::VARCHAR||'个交易日'
+                    END)
+                AS describe
+                ,(CASE WHEN flag_acct_id_1 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation1
+                ,(CASE WHEN flag_acct_id_2 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation2
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_3 = 1 AND relation_lvl_4 = 0
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,device_type AS acct_info_type,device AS acct_info,4 AS relation_lvl
+                ,'4级：' ||
+                    (CASE
+                        WHEN is_relate_target_sec=1 AND sec_code_1=sec_code_2 THEN '共同交易目标股票'||sec_code_1||'；'
+                        WHEN is_relate_target_sec=1 AND sec_code_1!=sec_code_2 THEN acct_id_1||'交易目标股票'||sec_code_1||','|| acct_id_2||'交易目标股票'||sec_code_2||'；'
+                        ELSE ''
+                    END) ||
+                    (CASE
+                        WHEN device_type = 'IP' AND diff_trade_date IS NOT NULL THEN '最小交易间隔'||diff_trade_date::VARCHAR||'个交易日'
+                    END)
+                AS describe
+                ,(CASE WHEN flag_acct_id_1 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation1
+                ,(CASE WHEN flag_acct_id_2 = 1 THEN '交易终端' ELSE '开户信息联系电话' END) AS acct_info_relation2
+        FROM    tmp_relation_device_detail
+        WHERE   relation_lvl_4 = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：自然人账户之间:开户信息联系地址一致' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'开户信息联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：自然人账户之间:开户信息联系电话一致' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'开户信息联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：机构账户之间:开户信息联系电话一致' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'开户信息联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：机构账户之间:开户信息联系地址一致' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'开户信息联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,legal_repr_id_card AS acct_info,5 AS relation_lvl,'5级：机构账户之间:机构主要负责人身份一致' AS describe
+                ,'机构主要负责人证件号码' AS acct_info_relation1
+                ,'机构主要负责人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_detail
+        WHERE   relation_legal = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,id_card AS acct_info,5 AS relation_lvl,'5级：自然人账户与机构账户之间:所属机构主要负责人身份一致' AS describe
+                ,'自然人证件号码' AS acct_info_relation1
+                ,'机构主要负责人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_jg_detail
+        WHERE   relation_id_legal = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：自然人账户与机构账户之间:开户信息联系电话一致' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'开户信息联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_jg_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：自然人账户与机构账户之间:开户信息联系地址一致' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'开户信息联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_jg_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,invest_cnsltnt_id_card AS acct_info,5 AS relation_lvl,'5级：资管产品之间:投资顾问一致' AS describe
+                ,'资管产品投资顾问证件号码' AS acct_info_relation1
+                ,'资管产品投资顾问证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg1_detail
+        WHERE   relation_invest_cnsltnt = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,cnsltnt_rep_id_card AS acct_info,5 AS relation_lvl,'5级：资管产品之间:投资顾问代表一致' AS describe
+                ,'资管产品投资顾问代表证件号码' AS acct_info_relation1
+                ,'资管产品投资顾问代表证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg1_detail
+        WHERE   relation_cnsltnt_rep = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,actl_operator_id_card AS acct_info,5 AS relation_lvl,'5级：资管产品之间:账户实际操作人一致' AS describe
+                ,'资管产品账户实际操作人证件号码' AS acct_info_relation1
+                ,'资管产品账户实际操作人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg1_detail
+        WHERE   relation_actl_operator = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,holder_id_card AS acct_info,5 AS relation_lvl,'5级：资管产品之间:（劣后级）投资委托人或投资受益人存在一致情形' AS describe
+                ,'资管产品（劣后级）投资委托人或投资受益人证件号码' AS acct_info_relation1
+                ,'资管产品（劣后级）投资委托人或投资受益人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg2_detail
+        WHERE   relation_holder = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：资管产品之间:（劣后级）投资委托人或投资受益人联系电话一致' AS describe
+                ,'资管产品（劣后级）投资委托人或投资受益人联系电话' AS acct_info_relation1
+                ,'资管产品（劣后级）投资委托人或投资受益人联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg2_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：资管产品之间:（劣后级）投资委托人或投资受益人联系地址一致' AS describe
+                ,'资管产品（劣后级）投资委托人或投资受益人联系地址' AS acct_info_relation1
+                ,'资管产品（劣后级）投资委托人或投资受益人联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_zg2_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,cnsltnt_rep_id_card AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:自然人账户持有人与资管产品账户投资顾问代表一致' AS describe
+                ,'自然人证件号码' AS acct_info_relation1
+                ,'资管产品账户投资顾问证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg1_detail
+        WHERE   relation_cnsltnt = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,actl_operator_id_card AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:自然人账户持有人与资管产品账户实际操作人一致' AS describe
+                ,'自然人证件号码' AS acct_info_relation1
+                ,'资管产品账户实际操作人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg1_detail
+        WHERE   relation_actl_operator = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,holder_id_card AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:自然人账户持有人与资管产品账户投资委托人或投资受益人存在一致情形' AS describe
+                ,'自然人证件号码' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg2_detail
+        WHERE   relation_holder = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:开户信息联系电话一致' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'开户信息联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg2_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:开户信息联系地址一致' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'开户信息联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg2_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:自然人账户开户预留电话号码与资管产品账户投资委托人或投资受益人电话号码存在一致情形' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg3_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：自然人账户与资管产品账户之间:自然人账户开户预留联系地址与资管产品账户投资委托人或投资受益人联系地址存在一致情形' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_gr_zg3_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,invest_cnsltnt_id_card AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户所属机构与资管产品账户投资顾问一致' AS describe
+                ,'机构账户所属机构证件号码' AS acct_info_relation1
+                ,'资管产品账户投资顾问证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg1_detail
+        WHERE   relation_invest = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,legal_repr_id_card AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户所属机构或其主要负责人与资管产品账户投资委托人或投资受益人存在一致情形' AS describe
+                ,'机构账户所属机构或其主要负责人证件号码' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg1_detail
+        WHERE   relation_actl_operator = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,cnsltnt_rep_id_card AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户所属机构主要负责人与资管产品账户实际操作人一致' AS describe
+                ,'机构账户所属机构或其主要负责人证件号码' AS acct_info_relation1
+                ,'资管产品账户实际操作人证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg1_detail
+        WHERE   relation_cnsltnt = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ID_CARD' AS acct_info_type,holder_id_card AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户所属机构主要负责人与资管产品账户投资顾问代表一致' AS describe
+                ,'机构账户所属机构主要负责人证件号码' AS acct_info_relation1
+                ,'资管产品账户投资顾问代表证件号码' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg2_detail
+        WHERE   relation_holder = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:开户信息联系电话一致' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'开户信息联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg2_detail
+        WHERE   relation_phone = 1    UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:开户信息联系地址一致' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'开户信息联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg2_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'MOBILE' AS acct_info_type,phone AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户开户预留电话号码与资管产品账户投资委托人或投资受益人电话号码存在一致情形' AS describe
+                ,'开户信息联系电话' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人联系电话' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg3_detail
+        WHERE   relation_phone = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'ADDRESS' AS acct_info_type,address AS acct_info,5 AS relation_lvl,'5级：机构账户与资管产品账户之间:机构账户开户预留联系地址与资管产品账户投资委托人或投资受益人联系地址存在一致情形' AS describe
+                ,'开户信息联系地址' AS acct_info_relation1
+                ,'资管产品账户投资委托人或投资受益人联系地址' AS acct_info_relation2
+        FROM    tmp_acct_relation_jg_zg3_detail
+        WHERE   relation_addr = 1
+        UNION ALL
+        SELECT  DISTINCT acct_id_1,acct_id_2,'CCRC_ACCT_ID' AS acct_info_type,ccrc_acct_id AS acct_info,6 AS relation_lvl,'6级：一码通一致' AS describe
+                ,'一码通' AS acct_info_relation1
+                ,'一码通' AS acct_info_relation2
+        FROM    tmp_acct_relation_lvl_6
+    )
+    SELECT  a.acct_id_1,b.acct_name AS acct_name_1,a.acct_id_2,c.acct_name AS acct_name_2,acct_info_type,acct_info,relation_lvl,describe,acct_info_relation1,acct_info_relation2
+    FROM    t1 a,tmp_acct_info b,tmp_acct_info c
+    WHERE   a.acct_id_1 = b.acct_id AND a.acct_id_2 = c.acct_id
+);
+
+DROP TABLE IF EXISTS tmp_result_node_acct;
+CREATE TEMP TABLE tmp_result_node_acct
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_id)
+AS (
+    WITH t1 AS (
+        SELECT  acct_id_1 AS acct_id
+        FROM    tmp_result_relation_info
+        UNION
+        SELECT  acct_id_2 AS acct_id
+        FROM    tmp_result_relation_info
+    )
+    SELECT  a.acct_id,b.acct_name,b.ccrc_acct_id,b.acct_type
+    FROM    t1 a,tmp_acct_info b
+    WHERE   a.acct_id = b.acct_id
+);
+
+DROP TABLE IF EXISTS tmp_result_node_acct_info;
+CREATE TEMP TABLE tmp_result_node_acct_info
+    WITH (ORIENTATION = COLUMN)
+    DISTRIBUTE BY HASH(acct_info)
+AS (
+    SELECT  DISTINCT acct_info_type,acct_info
+    FROM    tmp_result_relation_info
+);
+{% endsql %}    
