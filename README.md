@@ -12,7 +12,7 @@ pip3 install -r requirements.txt
 
 unzip css files and js files for frontend(optional)
 ```
-cd static && unzip admin.zip -d admin && unzip codemirror -d codemirror
+cd static && unzip admin.zip && unzip codemirror
 cd ..
 ```
 
