@@ -1,4 +1,4 @@
-Data Analyisi Platform Backend
+Data Analysis Platform Backend
 ==============================
 A system allowed SQL developers customize query web pages including inputs,outputs and SQL etc.
 
