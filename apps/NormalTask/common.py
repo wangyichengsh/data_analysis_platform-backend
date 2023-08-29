@@ -1246,6 +1246,11 @@ def xl2output(task_id, stream,stream_type='workbook'):
                     row2 = [ i.value for i in row2_raw ]
                 except StopIteration:
                     row2 = [''] * len(row1)
+                try:
+                    row3_raw = row_iter.send(2)
+                    row3 = [ i.value for i in row3_raw ]
+                except StopIteration:
+                    row3 = [''] * len(row1)
             elif ws.max_row <=0:
                 continue
             else:
@@ -1257,7 +1262,7 @@ def xl2output(task_id, stream,stream_type='workbook'):
             for (i,c) in enumerate(row1):
                 col = OutputColumn()
                 col.name = str(c.value).strip()
-                col.replace_key = ''
+                col.replace_key = row3[i] if row3[i] else ''
                 col.detail = row2[i] if row2[i] else ''
                 col.sheet = osheet
                 col.save()
