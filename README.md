@@ -4,6 +4,9 @@ A system allowed SQL developers customize query web pages including inputs,outpu
 
 [Demo](http://129.211.26.73:8080) (You can login in as a [developer](http://129.211.26.73:8080/login?password=deve%401234%21&username=deve1) or as a [user](http://129.211.26.73:8080/login?password=12345678%21&username=user1)) 
 
+[User guide](https://github.com/wangyichengsh/data_analysis_platform-frontend/blob/main/docs/user_guide.md) 
+
+
 Installation
 ============
 ```bash
