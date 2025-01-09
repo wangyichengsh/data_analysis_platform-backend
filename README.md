@@ -82,7 +82,7 @@ CREATE DATABASE anls OWNER user;
 
 Run the following command in Terminal:
 ```bash
-python3 manage.py makemigration
+python3 manage.py makemigrations
 python3 manage.py migrate
 ```
 
